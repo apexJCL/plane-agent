@@ -3,13 +3,13 @@
 Every agent acts through one shared agent account; which agent holds an item is its agent:<slug> label, and
 every comment is signed "agent=<slug> · session=… · where=… · openspec=…".
 
-Setup: `plane-agent init --url URL --workspace SLUG --project KEY --timezone Area/City` writes .plane-agent.toml
+Setup: `plane-agent init --url URL --workspace SLUG --project KEY` writes .plane-agent.toml
 (no secrets), then store the agent account's API token (`plane-agent config` says where it is looked for).
 Settings (environment beats the project file, which beats the user file):
   PLANE_BASE_URL         instance URL (default https://api.plane.so, Plane Cloud)
   PLANE_WORKSPACE_SLUG   workspace slug, from the workspace's URL
-  PLANE_PROJECT          default project key for queue, report, stale, create, log, bootstrap-project
-  PLANE_TZ               the project's IANA time zone, checked by bootstrap-project
+  PLANE_PROJECT          default project key for queue, stale, create, bootstrap-project
+  PLANE_TZ               optional IANA time zone that decides "today" (overdue, waits); default: this machine's
   PLANE_RATE_LIMIT       API calls a minute the instance allows (default 60)
   PLANE_AGENT            your agent slug, e.g. orchestrator or api-implementation (or --agent)
   PLANE_AGENT_SESSION    session/run id for the comment signature (or --session)
@@ -42,12 +42,18 @@ from .attachments import human_size
 from .client import PlaneClient, PlaneError
 from .notify import notifier
 from .protocol import KINDS, ORCHESTRATOR, PRIORITIES, Agent, ProtocolRefusal, WriteFailed
-from .report import render, report
 
+VERSION = "0.3.0"
 VERBS = [
     "init", "config", "whoami", "bootstrap-project", "queue", "dispatch", "claim", "check", "context", "comment",
-    "block", "review", "done", "answer", "accept", "reject", "rework", "close-epic", "ready", "backlog", "prioritize", "cancel", "reclaim", "create", "plan", "log", "report", "stale",
+    "block", "review", "done", "answer", "accept", "reject", "rework", "close-epic", "ready", "backlog", "prioritize", "cancel", "reclaim", "create", "plan", "stale",
 ]  # fmt: skip
+REMOVED = {  # verbs and flags removed in 0.3.0: they exit 2 with this message instead of a bare usage error
+    "report": "report was removed in 0.3.0 with the planning layer (plans, actuals, cycles); there is no replacement",
+    "log": "log was removed in 0.3.0 with retroactive entries; file the work with `create`, then `done` or `review`",
+    "stale --reclaim": "stale --reclaim was removed in 0.3.0; `stale` only lists now. Take each item back with "
+                       "`reclaim REF --reason TEXT` (orchestrator)",
+}  # fmt: skip
 
 
 def _where() -> str:
@@ -73,21 +79,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--where", default=None, help="repo@branch, a name and never a path; auto-detected from git")
     p.add_argument("--token-file", help="read the API token from this file")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--version", action="version", version=f"plane-agent {VERSION}")
     sub = p.add_subparsers(dest="verb", required=True, metavar="VERB")
 
     it = sub.add_parser("init", help="write the settings file (.plane-agent.toml here, or --user); no token")
     it.add_argument("--url", required=True, help="instance URL, e.g. https://api.plane.so or https://plane.example.com")
     it.add_argument("--workspace", required=True, help="workspace slug, as in https://<host>/<slug>/projects")
     it.add_argument("--project", help="default project key, e.g. WEB")
-    it.add_argument("--timezone", help="the project's IANA time zone, e.g. Europe/Madrid")
+    it.add_argument("--timezone", help="optional IANA time zone for \"today\", e.g. Europe/Madrid (default: local)")
     it.add_argument("--rate-limit", type=int, help="API calls a minute the instance allows (default 60)")
     it.add_argument("--user", action="store_true", help="write your user file instead of the project file")
     it.add_argument("--force", action="store_true", help="overwrite an existing file")
     sub.add_parser("config", help="show the resolved settings, where each came from, and where the token is read")
 
     sub.add_parser("whoami", help="show the account the token resolves to, and your agent slug")
-    b = sub.add_parser("bootstrap-project", help="shape a project's states and labels to the protocol and check "
-                       "its time zone and cycles against PLANE_TZ (idempotent)")  # fmt: skip
+    b = sub.add_parser("bootstrap-project", help="shape a project's states and labels to the protocol (idempotent)")
     b.add_argument("project", nargs="?", help="project key (default: the configured project)")
 
     q = sub.add_parser("queue", help="dispatchable items, in order; orchestrator also sweeps resolved Blocked items")
@@ -194,59 +200,49 @@ def build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--priority", default="none", choices=["urgent", "high", "medium", "low", "none"])
     cr.add_argument("--ready", action="store_true", help="create in Ready instead of Backlog")
     cr.add_argument("--blocked-by", nargs="+", metavar="REF")
-    cr.add_argument("--estimate", metavar="HOURS", help="plan it now: hours, a multiple of 0.25 (needs --target)")
-    cr.add_argument("--start", metavar="YYYY-MM-DD", help="planned start (default today, in the project's zone)")
-    cr.add_argument("--target", metavar="YYYY-MM-DD", help="planned finish; places it in that week's cycle")
+    cr.add_argument("--start", metavar="YYYY-MM-DD", help="start date (Plane's start_date)")
+    cr.add_argument("--target", metavar="YYYY-MM-DD", help="target date (Plane's target_date); orders the queue")
+    cr.add_argument("--estimate", help=argparse.SUPPRESS)  # removed in 0.3.0: accepted, ignored, with a notice
 
-    pl = sub.add_parser("plan", help="give an item its plan (estimate and dates) or revise it with --reason")
+    pl = sub.add_parser("plan", help="set or clear an open item's start and target dates (a held item: its holder "
+                        "or the orchestrator)")  # fmt: skip
     pl.add_argument("ref")
-    pl.add_argument("--estimate", metavar="HOURS", help="hours, a multiple of 0.25 (optional for epics)")
-    pl.add_argument("--target", metavar="YYYY-MM-DD", help="planned finish (required for the first plan)")
-    pl.add_argument("--start", metavar="YYYY-MM-DD", help="planned start (default today; a revision keeps it)")
-    pl.add_argument("--reason", default="", help="why the plan changed (required for a revision and for --clear)")
-    pl.add_argument("--clear", action="store_true", help="orchestrator: withdraw a Backlog item's plan (dates, "
-                    "cycle); the next plan is a fresh baseline")  # fmt: skip
-
-    lg = sub.add_parser("log", help="file work already done with its real times: Done (In Review for deploy), retro")
-    lg.add_argument("words", nargs="+", metavar="[PROJECT] NAME", help="project key (optional) and title")
-    lg.add_argument("--kind", required=True, choices=KINDS)
-    lg.add_argument("--started", required=True, metavar="TIME", help="e.g. 2026-10-20T14:00 (project zone if no offset)")
-    lg.add_argument("--ended", required=True, metavar="TIME")
-    lg.add_argument("--summary", required=True, help="what was done (markdown)")
-    lg.add_argument("--estimate", metavar="HOURS", help="what it would have been estimated at (post-hoc, no baseline)")
-    lg.add_argument("--parent", metavar="REF")
-
-    rp = sub.add_parser("report", help="plan vs actual for a week's cycle or a date span; --burndown for hours left")
-    rp.add_argument("project", nargs="?", help="project key (default: the configured project)")
-    span = rp.add_mutually_exclusive_group()
-    span.add_argument("--cycle", metavar="YYYY-Www", help="an ISO week, e.g. 2026-W43 (default: this week): the "
-                      "items that closed in its dates, whichever cycle they sit in")  # fmt: skip
-    span.add_argument("--since", metavar="YYYY-MM-DD", help="items closed on or after this day (with --until)")
-    rp.add_argument("--until", metavar="YYYY-MM-DD", help="last day of the --since span (default today)")
-    rp.add_argument("--burndown", action="store_true", help="daily hours left across the cycle's items")
-    rp.add_argument("--max-calls", type=int, metavar="N",
-                    help="stop after N API calls and print what was read, marked partial (default: 100 when "
-                         "the rate limit is 60 a minute or less, else no cap; 0 for no cap)")  # fmt: skip
+    pl.add_argument("--target", metavar="YYYY-MM-DD", help="target date")
+    pl.add_argument("--start", metavar="YYYY-MM-DD", help="start date")
+    pl.add_argument("--clear", action="store_true", help="remove both dates")
+    pl.add_argument("--reason", default="", help="why; without one, no comment is written")
+    pl.add_argument("--estimate", help=argparse.SUPPRESS)
 
     st = sub.add_parser("stale", help="agent-held items with no comment signed by that agent for --hours; then "
                         "expired waits, items In Review over 72 h, and what waits on the operator")  # fmt: skip
     st.add_argument("project", nargs="?", help="project key (default: the configured project)")
     st.add_argument("--hours", type=float, default=24)
-    st.add_argument("--reclaim", action="store_true", help="orchestrator: return them to Ready, unassigned "
-                    "(needs --hours >= 24; use `reclaim REF` for one item earlier)")  # fmt: skip
+    st.add_argument("--reclaim", action="store_true", help=argparse.SUPPRESS)  # removed in 0.3.0
+
+    for verb in ("report", "log"):  # removed in 0.3.0; unlisted, so old scripts get REMOVED's message
+        sub.add_parser(verb, add_help=False).add_argument("rest", nargs=argparse.REMAINDER)
     return p
+
+
+def _removed(args: argparse.Namespace) -> str | None:
+    if args.verb in ("report", "log"):
+        return REMOVED[args.verb]
+    if args.verb == "stale" and args.reclaim:
+        return REMOVED["stale --reclaim"]
+    return None
+
+
+def _deprecated(args: argparse.Namespace) -> None:
+    if getattr(args, "estimate", None) is not None:
+        _warn(f"--estimate is deprecated and ignored since 0.3.0 (estimates were removed); drop it from {args.verb}")
 
 
 # Orchestrator-only moves (spec: the orchestrator sweeps and reclaims; nudges come from it or the operator).
 def _orchestrator_only(args: argparse.Namespace) -> str | None:
     if args.verb == "comment" and args.force:
         return "comment --force"
-    if args.verb == "stale" and args.reclaim:
-        return "stale --reclaim"
     if args.verb == "queue" and args.sweep:
         return "queue --sweep"
-    if args.verb == "plan" and args.clear:
-        return "plan --clear"
     if args.verb == "review" and args.for_slug:
         return "review --for"
     if args.verb in ("accept", "reject", "rework", "close-epic", "ready", "backlog", "cancel", "reclaim"):
@@ -255,7 +251,7 @@ def _orchestrator_only(args: argparse.Namespace) -> str | None:
 
 
 def _warn(message: str | None) -> None:
-    """A warning the command survives (exit 0), e.g. a cycle Plane refused because its week has ended."""
+    """A warning the command survives (exit 0), e.g. a deprecated flag."""
     if message:
         print(f"plane-agent: warning: {message}", file=sys.stderr)
 
@@ -284,25 +280,15 @@ def run(args: argparse.Namespace, agent: Agent) -> int:
         me = agent.me
         out.append({"agent": agent.slug, "account": me.get("display_name"), "id": me["id"], "email": me.get("email")})
     elif v == "bootstrap-project":
-        tz = args.timezone
-        if not tz:
-            print("plane-agent: set the project's time zone: `timezone` in .plane-agent.toml or PLANE_TZ, "
-                  "e.g. Europe/Madrid", file=sys.stderr)  # fmt: skip
-            return 2
-        changes = agent.bootstrap_project(args.project, tz)
-        out = changes or ["no changes"]
+        out = agent.bootstrap_project(args.project) or ["no changes"]
     elif v == "queue":
         sweep = args.sweep if args.sweep is not None else agent.slug == ORCHESTRATOR
-        items, unplanned, log = agent.queue(args.project, sweep=sweep)
+        items, log = agent.queue(args.project, sweep=sweep)
         proj = agent.project(args.project)
         out = log + [
             {"ref": proj.ref(i), "priority": i.get("priority"), "target": i.get("target_date"), "name": i["name"]}
             for i in items
         ]
-        if unplanned and not args.json:
-            out.append("unplanned (dispatch refuses these until `plan REF --estimate H --target D`):")
-        out += [{"ref": proj.ref(i), "priority": i.get("priority"), "unplanned": True, "name": i["name"]}
-                for i in unplanned]  # fmt: skip
         _footer(agent.attention(args.project), proj)
     elif v == "dispatch":
         agent.dispatch(args.ref, args.to)
@@ -384,37 +370,26 @@ def run(args: argparse.Namespace, agent: Agent) -> int:
     elif v == "create":
         item = agent.create(
             args.project, args.name, args.kind, args.description, args.parent, args.priority,
-            args.ready, args.blocked_by, args.estimate, args.start, args.target,
+            args.ready, args.blocked_by, args.start, args.target,
         )  # fmt: skip
         out.append({"created": f"{args.project.upper()}-{item['sequence_id']}", "id": item["id"]})
-        _warn(item.get("warning"))
-    elif v == "plan" and args.clear:
-        if args.estimate or args.target or args.start:
-            print("plane-agent: plan --clear takes no --estimate, --target or --start", file=sys.stderr)
-            return 2
-        agent.withdraw_plan(args.ref, args.reason)
-        out.append({"withdrawn": args.ref.upper()})
     elif v == "plan":
-        plan, warning = agent.plan(args.ref, args.estimate, args.target, args.start, args.reason)
-        out.append({"planned": args.ref.upper(), "statement": plan.statement()})
-        _warn(warning)
-    elif v == "log":
-        item = agent.log(args.project, args.name, args.kind, args.started, args.ended, args.summary,
-                         args.estimate, args.parent)  # fmt: skip
-        out.append({"logged": f"{args.project.upper()}-{item['sequence_id']}", "state": item["state_name"]})
-        _warn(item.get("warning"))
-    elif v == "report":
-        cap = args.max_calls
-        if cap is None:
-            cap = 100 if agent.client.rate_limit <= 60 else 0
-        rep = report(agent, args.project, cycle=args.cycle, since=args.since, until=args.until,
-                     burndown=args.burndown, max_calls=cap or None)  # fmt: skip
-        out = [rep] if args.json else render(rep)
+        dated = args.target or args.start or args.clear
+        if args.clear and (args.target or args.start):
+            print("plane-agent: plan --clear takes no --target or --start", file=sys.stderr)
+            return 2
+        if not dated and args.estimate is None:
+            print("plane-agent: plan needs --target, --start or --clear", file=sys.stderr)
+            return 2
+        if not dated:
+            out.append({"ref": args.ref.upper(), "unchanged": True})  # an old estimate-only revision: a no-op
+        else:
+            dates = agent.plan(args.ref, args.target, args.start, args.clear, args.reason)
+            out.append({"ref": args.ref.upper(), **{k.removesuffix("_date"): v for k, v in dates.items()}})
     elif v == "stale":
-        found = agent.stale(args.project, args.hours, args.reclaim)
+        found = agent.stale(args.project, args.hours)
         proj = agent.project(args.project)
-        out = [{"ref": proj.ref(i), "agent": f"agent:{slug}", "last_activity": t.isoformat(timespec="minutes"),
-                "reclaimed": args.reclaim} if t else
+        out = [{"ref": proj.ref(i), "agent": f"agent:{slug}", "last_activity": t.isoformat(timespec="minutes")} if t else
                {"ref": proj.ref(i), "agent": slug, "problem": "several agent labels; operator must fix"}
                for i, slug, t in found]  # fmt: skip
         out += [{"ref": proj.ref(i), "expired_wait": str(d) if d else "no date on record", "name": i["name"]}
@@ -453,12 +428,12 @@ def _stdin_text(args: argparse.Namespace) -> str | None:
     return None
 
 
-PROJECT_VERBS = ("bootstrap-project", "queue", "report", "stale", "create", "log")
+PROJECT_VERBS = ("bootstrap-project", "queue", "stale", "create")
 
 
 def _project_args(args: argparse.Namespace, cfg: conf.Config) -> str | None:
     """Fill in the default project (and split `[PROJECT] NAME` for create/log). Returns a usage error."""
-    if args.verb in ("create", "log"):
+    if args.verb == "create":
         if len(args.words) > 2:
             return f"{args.verb} takes [PROJECT] NAME; quote the title"
         args.project, args.name = args.words if len(args.words) == 2 else (None, args.words[0])
@@ -471,10 +446,8 @@ def _project_args(args: argparse.Namespace, cfg: conf.Config) -> str | None:
 
 def _writes(args: argparse.Namespace) -> bool:
     """True when the command may write to the tracker, so it must carry a session id."""
-    if args.verb in ("whoami", "context", "check", "report"):
+    if args.verb in ("whoami", "context", "check", "stale"):
         return False
-    if args.verb == "stale":
-        return args.reclaim
     if args.verb == "queue":
         return args.sweep if args.sweep is not None else args.agent == ORCHESTRATOR
     return True
@@ -572,6 +545,10 @@ def _show_config(args: argparse.Namespace, cfg: conf.Config) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if gone := _removed(args):
+        print(f"plane-agent: {gone}", file=sys.stderr)
+        return 2
+    _deprecated(args)
     if args.verb == "init":
         return _init(args)
     try:
@@ -593,7 +570,6 @@ def main(argv: list[str] | None = None) -> int:
               "PLANE_AGENT_SESSION (an orchestrator gives each subagent its own). To sign as session=unknown "
               "instead, set `require_session = false` in your user file", file=sys.stderr)  # fmt: skip
         return 2
-    args.timezone = cfg.timezone
     try:
         cfg.require("workspace")
         token = conf.resolve_token(cfg, args.token_file)
@@ -605,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         where = _clean_where(args.where) if args.where else _where()
         push = notifier(cfg.notify_command) if cfg.notify_command else None
         agent = Agent(client, args.agent, session=args.session or "unknown", where=where, change=args.openspec,
-                      notify=push)  # fmt: skip
+                      notify=push, tz=cfg.timezone or None)  # fmt: skip
         return run(args, agent)
     except ProtocolRefusal as e:
         print(f"plane-agent: {e}", file=sys.stderr)

@@ -31,17 +31,8 @@ def ref(it):
 TARGET = "2026-10-16"  # the fake's clock starts Tuesday 2026-10-06; this is the Friday after
 
 
-def planned(orch, it, estimate="2h", target=TARGET):
-    """The item's ref, after giving it a baseline plan if it has none (dispatch refuses unplanned items)."""
-    if not any("plan: rev=" in c["comment_html"] for c in orch.client.comments(it["project"], it["id"])):
-        orch.plan(ref(it), estimate, target=target)
-    return ref(it)
-
-
 def claimable(orch, sweep=False):
-    """Every claimable item, planned first; `queue` lists unplanned ones apart."""
-    ready, unplanned, _log = orch.queue("HOME", sweep=sweep)
-    return ready + unplanned
+    return orch.queue("HOME", sweep=sweep)[0]
 
 
 def state_name(fake, it):
@@ -59,7 +50,7 @@ def comments_on(fake, it):
 def started(fake, orch, slug, name="A", **kw):
     """A Ready item dispatched to `slug` and claimed by it; returns (item, worker)."""
     it = fake.seed_item(fake.pid, name, "Ready", **kw)
-    orch.dispatch(planned(orch, it), slug)
+    orch.dispatch(ref(it), slug)
     w = agent(fake, slug)
     w.claim(ref(it))
     return it, w
@@ -71,7 +62,7 @@ def started(fake, orch, slug, name="A", **kw):
 def test_bootstrap_shapes_states_and_is_idempotent(fake):
     todo_id = fake.state(fake.pid, "Todo")["id"]
     a = agent(fake, "orchestrator")
-    changes = a.bootstrap_project("HOME", TZ)
+    changes = a.bootstrap_project("HOME")
     assert "renamed state Todo -> Ready" in changes
     ordered = sorted(fake.states[fake.pid], key=lambda s: s["sequence"])
     assert [(s["name"], s["group"]) for s in ordered] == [(n, g) for n, g, _ in STATES]
@@ -79,7 +70,7 @@ def test_bootstrap_shapes_states_and_is_idempotent(fake):
     assert fake.state(fake.pid, "Backlog")["default"] is True
     assert {lb["name"] for lb in fake.labels[fake.pid]} >= {"kind:deploy", NEEDS_HUMAN}
     # Scenario "New project bootstrap": a re-run changes nothing.
-    assert agent(fake, "orchestrator").bootstrap_project("HOME", TZ) == []
+    assert agent(fake, "orchestrator").bootstrap_project("HOME") == []
 
 
 def test_bad_slug_refused(fake):
@@ -135,7 +126,7 @@ def test_sweep_returns_resolved_blocked_items_to_ready(fake, orch):
 
 def test_dispatch_labels_item_before_worker_starts(fake, orch):
     it = fake.seed_item(fake.pid, "A", "Ready", labels=[orch.project("HOME").label_id("kind:feature")])
-    orch.dispatch(planned(orch, it), "api-implementation")
+    orch.dispatch(ref(it), "api-implementation")
     # Scenario "Orchestrator dispatch": In Progress, this account assigned, agent label set, before the worker runs.
     assert it["assignees"] == [fake.uid("claude")] and state_name(fake, it) == "In Progress"
     assert label_names(fake, it) == {"kind:feature", "agent:api-implementation"}
@@ -151,7 +142,7 @@ def test_claim_posts_signed_comment(fake, orch):
 
 def test_claim_refused_when_dispatched_to_someone_else(fake, orch):
     it = fake.seed_item(fake.pid, "A", "Ready")
-    orch.dispatch(planned(orch, it), "api-implementation")
+    orch.dispatch(ref(it), "api-implementation")
     with pytest.raises(ProtocolRefusal) as e:  # same account, different slug
         agent(fake, "docs-writer").claim(ref(it))
     assert e.value.code == EXIT_OWNERSHIP_LOST
@@ -161,12 +152,12 @@ def test_claim_refused_when_dispatched_to_someone_else(fake, orch):
 def test_dispatch_refuses_non_ready_and_busy_slug(fake, orch):
     backlog = fake.seed_item(fake.pid, "A", "Backlog")
     with pytest.raises(ProtocolRefusal) as e:
-        orch.dispatch(planned(orch, backlog), "api-implementation")
+        orch.dispatch(ref(backlog), "api-implementation")
     assert e.value.code == EXIT_NOT_CLAIMABLE
     started(fake, orch, "api-implementation", name="first")
     second = fake.seed_item(fake.pid, "second", "Ready")
     with pytest.raises(ProtocolRefusal) as e:  # Scenario "Slug already in use"
-        orch.dispatch(planned(orch, second), "api-implementation")
+        orch.dispatch(ref(second), "api-implementation")
     assert e.value.code == EXIT_REFUSED and state_name(fake, second) == "Ready"
 
 
@@ -175,7 +166,7 @@ def test_redispatch_replaces_agent_label(fake, orch):
     w.review(ref(it), "please look")
     it["state"] = fake.state(fake.pid, "Ready")["id"]  # operator sends it back
     it["assignees"] = []
-    orch.dispatch(planned(orch, it), "api-fixes")
+    orch.dispatch(ref(it), "api-fixes")
     assert {n for n in label_names(fake, it) if n.startswith("agent:")} == {"agent:api-fixes"}
 
 
@@ -221,20 +212,10 @@ def test_write_aborted_after_operator_takes_item(fake, orch):
 def test_reclaimed_under_live_worker_cannot_finish(fake, orch):
     it, w = started(fake, orch, "api-implementation")
     fake.tick(hours=25)
-    orch.stale("HOME", 24, reclaim=True)
+    orch.reclaim(ref(it), "the session went quiet")
     with pytest.raises(ProtocolRefusal) as e:  # Scenario "Reclaimed under a live worker"
         w.done(ref(it), "finished late")
     assert e.value.code == EXIT_OWNERSHIP_LOST and state_name(fake, it) == "Ready"
-
-
-def test_stale_reclaim_has_a_24h_floor(fake, orch):
-    it, _w = started(fake, orch, "api")
-    fake.tick(hours=3)
-    with pytest.raises(ProtocolRefusal) as e:
-        orch.stale("HOME", 2, reclaim=True)
-    assert e.value.code == EXIT_REFUSED and "reclaim REF" in str(e.value)
-    assert [f[1] for f in orch.stale("HOME", 2, reclaim=False)] == ["api"]  # listing early is fine
-    assert state_name(fake, it) == "In Progress"
 
 
 def test_reclaim_verb_refuses_an_active_holder_unless_forced(fake, orch):
@@ -296,7 +277,7 @@ def test_orchestrator_rejects_reviewed_item(fake, orch):
     orch.reject(ref(it), "tests fail")  # Scenario "Orchestrator rejects reviewed work"
     assert state_name(fake, it) == "Ready" and it["assignees"] == []
     assert [ref(i) for i in claimable(orch, sweep=False)] == [ref(it)]
-    orch.dispatch(planned(orch, it), "api")
+    orch.dispatch(ref(it), "api")
     assert label_names(fake, it) >= {"agent:api"}
 
 
@@ -530,7 +511,7 @@ def test_block_on_records_relation_and_cycle_refused(fake, orch):
     w.block_on(ref(a), [ref(b)], "needs B first")  # Scenario "Waiting on other work"
     assert {"issue": a["id"], "related": b["id"], "type": "blocked_by"} in fake.relations
     assert state_name(fake, a) == "Blocked"
-    orch.dispatch(planned(orch, b), "worker-b")
+    orch.dispatch(ref(b), "worker-b")
     w2 = agent(fake, "worker-b")
     w2.claim(ref(b))
     n_rel = len(fake.relations)
@@ -549,25 +530,25 @@ def test_stale_ignores_comments_by_others(fake, orch):
     fake.tick(hours=23)
     orch.note(ref(it), "status?", force=True)  # Scenario "Nudge does not refresh a claim"
     agent(fake, "api-implementation").note(ref(other), "still going")  # a longer slug sharing the prefix
-    assert orch.stale("HOME", 24, reclaim=False) == []
+    assert orch.stale("HOME", 24) == []
     fake.tick(hours=1, minutes=5)
-    found = orch.stale("HOME", 24, reclaim=True)
-    assert [(i["id"], slug) for i, slug, _ in found] == [(it["id"], "api")]
-    assert state_name(fake, it) == "Ready" and it["assignees"] == []  # Scenario "Crashed session"
+    found = orch.stale("HOME", 24)
+    assert [(i["id"], slug) for i, slug, _ in found] == [(it["id"], "api")]  # Scenario "Crashed session"
+    assert state_name(fake, it) == "In Progress"  # listed, not taken back
 
 
 def test_stale_counts_dispatch_time_for_silent_worker(fake, orch):
     it = fake.seed_item(fake.pid, "A", "Ready")
     fake.tick(hours=48)  # created long ago
-    orch.dispatch(planned(orch, it), "api-implementation")
+    orch.dispatch(ref(it), "api-implementation")
     fake.tick(hours=2)
-    assert orch.stale("HOME", 24, reclaim=False) == []  # the clock starts at dispatch, not creation
+    assert orch.stale("HOME", 24) == []  # the clock starts at dispatch, not creation
 
 
 def test_stale_skips_items_held_by_a_human(fake, orch):
     fake.seed_item(fake.pid, "mine", "In Progress", assignees=[fake.uid("operator")])
     fake.tick(hours=48)
-    assert orch.stale("HOME", 24, reclaim=False) == []
+    assert orch.stale("HOME", 24) == []
 
 
 # -- context -----------------------------------------------------------------
@@ -588,7 +569,7 @@ def test_context_returns_trail_filtered_by_agent(fake, orch):
 def test_openspec_change_signs_comments_and_descriptions(fake, orch):
     a = agent(fake, "orchestrator", change="add-meow-api")
     item = a.create("HOME", "connector", "feature", description="Write the connector", ready=True,
-                    estimate="3h", target=TARGET)
+                    target=TARGET)
     a.dispatch(ref(fake.items[item["id"]]), "api-implementation")
     assert "openspec=add-meow-api" in comments_on(fake, fake.items[item["id"]])[-1]
 
@@ -623,17 +604,17 @@ def test_quoted_signature_does_not_refresh_stale_clock(fake, orch):
     fake.tick(hours=23)
     orch.note(ref(it), "Earlier, agent=api · session=s-api wrote: 'nearly done'. Status?", force=True)
     fake.tick(hours=1, minutes=5)
-    assert [i["id"] for i, _, _ in orch.stale("HOME", 24, reclaim=False)] == [it["id"]]
+    assert [i["id"] for i, _, _ in orch.stale("HOME", 24)] == [it["id"]]
     assert all("Status?" not in c["text"] for c in orch.context(ref(it), agent="api")["comments"])
 
 
 def test_stale_without_dispatch_comment_uses_label_activity(fake, orch):
     it = fake.seed_item(fake.pid, "A", "Ready")
     fake.tick(hours=72)  # an old item
-    orch.dispatch(planned(orch, it), "api")
+    orch.dispatch(ref(it), "api")
     fake.comments = [c for c in fake.comments if "Dispatched to" not in c["comment_html"]]  # comment POST lost
     fake.tick(hours=1)
-    assert orch.stale("HOME", 24, reclaim=True) == []
+    assert orch.stale("HOME", 24) == []
     assert state_name(fake, it) == "In Progress"
 
 
@@ -641,7 +622,7 @@ def test_dispatch_fails_if_a_second_agent_label_survives(fake, orch):
     proj = orch.project("HOME")
     it = fake.seed_item(fake.pid, "A", "Ready")
     stray = orch._agent_label_id(proj, "old")
-    planned(orch, it)
+    ref(it)
     real_update = orch.client.update_item
 
     def operator_races(pid, iid, body):  # the operator re-adds a label between our PATCH and the re-read
@@ -651,7 +632,7 @@ def test_dispatch_fails_if_a_second_agent_label_survives(fake, orch):
 
     orch.client.update_item = operator_races
     with pytest.raises(ProtocolRefusal) as e:
-        orch.dispatch(planned(orch, it), "api")
+        orch.dispatch(ref(it), "api")
     assert e.value.code == EXIT_NOT_CLAIMABLE
 
 
@@ -660,7 +641,7 @@ def test_two_agent_labels_reported_not_reclaimed(fake, orch):
     it, _w = started(fake, orch, "api")
     it["labels"] = it["labels"] + [orch._agent_label_id(proj, "docs")]
     fake.tick(hours=48)
-    found = orch.stale("HOME", 24, reclaim=True)
+    found = orch.stale("HOME", 24)
     assert [(i["id"], last) for i, _, last in found] == [(it["id"], None)]
     assert state_name(fake, it) == "In Progress"
 
@@ -669,13 +650,13 @@ def test_dispatch_refuses_needs_human_and_open_blockers(fake, orch):
     proj = orch.project("HOME")
     nh = fake.seed_item(fake.pid, "answered?", "Ready", labels=[proj.label_id(NEEDS_HUMAN)])
     with pytest.raises(ProtocolRefusal) as e:
-        orch.dispatch(planned(orch, nh), "api")
+        orch.dispatch(ref(nh), "api")
     assert e.value.code == EXIT_REFUSED
     pre = fake.seed_item(fake.pid, "pre", "Backlog")
     it = fake.seed_item(fake.pid, "A", "Ready")
     fake.relate(it, pre)
     with pytest.raises(ProtocolRefusal) as e:
-        orch.dispatch(planned(orch, it), "api")
+        orch.dispatch(ref(it), "api")
     assert e.value.code == EXIT_NOT_CLAIMABLE
 
 
@@ -687,7 +668,7 @@ def test_operator_answers_question_then_dispatchable(fake, orch):
     it["state"] = fake.state(fake.pid, "Ready")["id"]
     it["assignees"] = []
     assert [i["id"] for i in claimable(orch, sweep=True)] == [it["id"]]
-    orch.dispatch(planned(orch, it), "api")
+    orch.dispatch(ref(it), "api")
     assert any("Which port?" in c["text"] for c in orch.context(ref(it))["comments"])
 
 
@@ -697,7 +678,7 @@ def test_cli_gates_orchestrator_moves(fake, monkeypatch, capsys):
     monkeypatch.setattr(cli.conf, "resolve_token", lambda _c, _f: "tok-claude")
     monkeypatch.setattr(cli, "PlaneClient", lambda *a, **k: PlaneClient(*a, **k, transport=fake.transport()))
     monkeypatch.setenv("PLANE_TZ", TZ)
-    assert cli.main(["--agent", "api", "--session", "t", "--where", "x", "stale", "HOME", "--reclaim"]) == 5
+    assert cli.main(["--agent", "api", "--session", "t", "--where", "x", "reclaim", "HOME-1", "--reason", "r"]) == 5
     assert cli.main(["--agent", "api", "--session", "t", "--where", "x", "accept", "HOME-1", "--summary", "s"]) == 5
     assert cli.main(["--agent", "api", "--session", "t", "--where", "x", "close-epic", "HOME-1", "--summary", "s"]) == 5
     assert cli.main(["--agent", "api", "--session", "t", "--where", "x", "ready", "HOME-1"]) == 5
@@ -760,7 +741,8 @@ def test_cli_reads_a_dash_body_from_stdin(fake, orch, monkeypatch, capsys):
 
 def test_help_lists_every_verb():
     sub = next(a for a in build_parser()._actions if a.dest == "verb")
-    assert set(sub.choices) == set(VERBS)
+    assert set(sub.choices) == set(VERBS) | {"report", "log"}  # removed verbs parse only to explain they are gone
+    assert not {"report", "log"} & {a.dest for a in sub._choices_actions}  # and stay out of --help
 
 
 def test_bad_token_is_rejected(fake):
@@ -800,27 +782,9 @@ def test_rate_limit_gives_up_after_max_wait():
     assert e.value.status == 429 and sum(slept) == 180 and len(calls) == 4
 
 
-def test_paced_reads_heed_the_remaining_count():
-    left = iter(["50", "5", "x"])
-
-    def handle(req):
-        return httpx.Response(200, headers={"X-RateLimit-Remaining": next(left), "X-RateLimit-Reset": "12"},
-                              json={"id": "u1"})  # fmt: skip
-
-    slept = []
-    c = PlaneClient("https://plane.test", "acme", "t", transport=httpx.MockTransport(handle), sleep=slept.append,
-                    rate_limit=60)  # fmt: skip
-    c.me()
-    assert slept == []  # unpaced: the count is ignored
-    c.pace(after=100)
-    c.me()  # 5 left of 60: wait for the window to reset
-    c.me()  # an unreadable count changes nothing
-    assert slept == [12.0]
-
-
 # -- optional summaries (optional-summaries) -----------------------------------
 
-ST = "plan: rev=0 estimate=3h start=2026-10-06 target=2026-10-09"
+ST = "hold: from=In Progress until=2026-10-09"
 
 
 def test_closing_without_a_summary(fake, orch):
@@ -869,20 +833,15 @@ def test_no_body_ends_in_a_statement(fake, orch):
                  lambda: w.note(ref(it), ST)):  # fmt: skip
         with pytest.raises(ProtocolRefusal) as e:
             move()
-        assert e.value.code == EXIT_REFUSED and "plan or actual statement" in str(e.value)
+        assert e.value.code == EXIT_REFUSED and "hold statement" in str(e.value)
     assert state_name(fake, it) == "In Progress" and len(comments_on(fake, it)) == before
-    w.done(ref(it), f"{ST}\n\nThe estimate above held.")  # a statement earlier in the body is fine
+    w.done(ref(it), f"{ST}\n\nThe hold above is quoted.")  # a statement earlier in the body is fine
     assert state_name(fake, it) == "Done"
     unheld = fake.seed_item(fake.pid, "U", "Ready")
-    planned(orch, unheld)
-    for move in (lambda: orch.plan(ref(unheld), "5h", reason=f"Scope grew.\n\n{ST}"),
-                 lambda: w.log("HOME", "retro", "chore", started="2026-10-06 09:00", ended="2026-10-06 10:00",
-                               summary=ST)):  # fmt: skip
-        with pytest.raises(ProtocolRefusal) as e:
-            move()
-        assert e.value.code == EXIT_REFUSED and "plan or actual statement" in str(e.value)
-    assert len(comments_on(fake, unheld)) == 1  # its first plan only
+    with pytest.raises(ProtocolRefusal) as e:
+        orch.plan(ref(unheld), target=TARGET, reason=f"Scope grew.\n\n{ST}")
+    assert e.value.code == EXIT_REFUSED and comments_on(fake, unheld) == []
     r = reviewed(fake, orch, name="R")
     with pytest.raises(ProtocolRefusal):
-        orch.reject(ref(r), "actual: started=2026-10-06T09:00-07:00 ended=2026-10-06T11:00-07:00")
+        orch.reject(ref(r), ST)
     assert state_name(fake, r) == "In Review"

@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -19,28 +19,6 @@ from markdown_it import MarkdownIt
 from .attachments import File, FileRefused, human_size
 from .attachments import load as load_files
 from .client import PlaneClient, PlaneError
-from .planning import (
-    Plan,
-    PlanError,
-    actual_statement,
-    baseline,
-    check_dates,
-    cycle_for_week,
-    hold_statement,
-    hours,
-    is_statement,
-    last_rev,
-    latest,
-    latest_estimate,
-    latest_hold,
-    parse_day,
-    parse_estimate,
-    parse_moment,
-    plans,
-    signature,
-    week_of,
-    withdrawal_statement,
-)
 
 # Ordered state model. Bootstrap maps Plane's defaults onto it, so "Todo" becomes "Ready".
 STATES: list[tuple[str, str, str]] = [
@@ -57,10 +35,8 @@ CLOSED_GROUPS = {"completed", "cancelled"}
 
 KINDS = ["feature", "bug", "chore", "spike", "deploy"]
 NEEDS_HUMAN = "needs-human"
-RETRO = "retro"  # filed after the work was done, with its real times (`log`)
 WAITING = "waiting"  # Blocked on time or the outside world (`block --wait`), not on an item or the operator
 LABELS: list[tuple[str, str]] = [(f"kind:{k}", "#64748b") for k in KINDS] + [(NEEDS_HUMAN, "#dc2626"),
-                                                                              (RETRO, "#a855f7"),
                                                                               (WAITING, "#eab308")]  # fmt: skip
 HUMAN_ONLY = ("kind:deploy", NEEDS_HUMAN)  # only the operator closes these
 
@@ -143,8 +119,59 @@ def _p(text: str) -> str:
 
 def _signature(sig: str) -> str:
     """The signature paragraph, set off from the text by a horizontal rule so it doesn't blend in. It stays a
-    plain last paragraph: `signed_by` and planning.py match it there, with or without the rule."""
+    plain last paragraph: `signed_by` and `tail_statement` match it there, with or without the rule."""
     return "<hr>" + _p(sig)
+
+
+# -- holds: the one machine statement left in the trail ------------------------
+# A block or wait records where the item returns when released, as the plain paragraph right before the signature:
+#     hold: from=In Progress until=2026-10-23
+# Anywhere else (quoted, earlier in the body, unsigned) it doesn't count. Trails from before 0.3.0 also carry
+# `plan:` and `actual:` statements; they are ordinary comments now.
+
+_TAIL = re.compile(r"(?:^|</[a-z0-9]+>)<p>([^<]*)</p>(?:<hr[^>]*>)?<p>agent=([a-z0-9][a-z0-9-]*) · session=[^<]*</p>\s*$")
+_HOLD = re.compile(r"hold: from=(Ready|In Progress|In Review)(?: until=(\d{4}-\d\d-\d\d))?")
+_SIG = re.compile(r"(?:^|<p[^>]*>)agent=([a-z0-9][a-z0-9-]*) · session=([^<·]*?)(?: · [^<]*)?</p>\s*$")
+
+
+def tail_statement(comment_html: str) -> tuple[str, str] | None:
+    """(statement text, signing slug) when the comment ends in a statement paragraph plus a signature."""
+    m = _TAIL.search(comment_html or "")
+    return (html.unescape(m[1]), m[2]) if m else None
+
+
+def hold_statement(origin: str, until: date | None = None) -> str:
+    """Where a blocked item returns when it is released, and for a wait, its last day."""
+    return f"hold: from={origin}" + (f" until={until.isoformat()}" if until else "")
+
+
+def latest_hold(comments: list[dict]) -> tuple[str, date | None] | None:
+    """(state the item returns to, the wait's last day or None) from the newest hold statement."""
+    for c in sorted(comments, key=lambda c: c["created_at"], reverse=True):
+        t = tail_statement(c.get("comment_html", ""))
+        if t and (m := _HOLD.fullmatch(t[0])):
+            return m[1], date.fromisoformat(m[2]) if m[2] else None
+    return None
+
+
+def signature(comment_html: str) -> tuple[str, str] | None:
+    """(slug, session) from the comment's signature paragraph, if it has one."""
+    m = _SIG.search(comment_html or "")
+    return (m[1], html.unescape(m[2]).strip()) if m else None
+
+
+def parse_day(value: str | None, what: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ProtocolRefusal(f"{what} {value!r} must be a date like 2026-10-23", EXIT_REFUSED) from None
+
+
+def _zone(name: str | None) -> tzinfo:
+    """The configured IANA zone, else this machine's local zone. It only decides what "today" is."""
+    return ZoneInfo(name) if name else datetime.now().astimezone().tzinfo or UTC
 
 
 def _ts(value: str) -> datetime:
@@ -179,10 +206,10 @@ def signed_by(comment_html: str, slug: str) -> bool:
 
 
 def check_body(text: str, what: str) -> None:
-    """A free-text body that ends right before the signature can't itself end in a plan or actual statement, or
-    planning.py would read it as one. Checked before any write."""
-    if text.strip() and is_statement(text.strip().split("\n\n")[-1]):
-        raise ProtocolRefusal(f"{what} can't end in a plan or actual statement; use `plan` or `log`", EXIT_REFUSED)
+    """A free-text body that ends right before the signature can't itself end in a hold statement, or the sweep
+    would read it as one. Checked before any write."""
+    if text.strip() and _HOLD.fullmatch(text.strip().split("\n\n")[-1].strip()):
+        raise ProtocolRefusal(f"{what} can't end in a hold statement; use `block`", EXIT_REFUSED)
 
 
 def _then(text: str) -> str:
@@ -205,12 +232,6 @@ class Project:
     identifier: str
     states: dict[str, dict]  # by name
     labels: dict[str, dict]  # by name
-    tz: str = "UTC"  # the project's time zone: plan dates, weeks and burndown days are computed in it
-    cycle_view: bool = False
-
-    @property
-    def zone(self) -> ZoneInfo:
-        return ZoneInfo(self.tz or "UTC")
 
     @property
     def state_by_id(self) -> dict[str, dict]:
@@ -252,6 +273,7 @@ class Agent:
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
     notify: Callable[[dict], None] | None = None  # the user's notify_command (notify.py); None: no push
+    tz: str | None = None  # IANA zone for "today" (overdue, waits); None: this machine's local zone
     notices: list[str] = field(default_factory=list)  # warnings the command survives; the CLI prints them
     _me: dict | None = None
     _projects: dict[str, Project] = field(default_factory=dict)
@@ -277,10 +299,10 @@ class Agent:
     def _load(self, raw: dict, identifier: str) -> Project:
         states = {s["name"]: s for s in self.client.states(raw["id"])}
         labels = {lb["name"]: lb for lb in self.client.labels(raw["id"])}
-        return Project(raw["id"], identifier, states, labels, raw.get("timezone") or "UTC", bool(raw.get("cycle_view")))
+        return Project(raw["id"], identifier, states, labels)
 
-    def today(self, proj: Project) -> date:
-        return self.now().astimezone(proj.zone).date()
+    def today(self) -> date:
+        return self.now().astimezone(_zone(self.tz)).date()
 
     def resolve(self, ref: str) -> tuple[Project, dict]:
         """'HOME-12' -> (project, fresh item)."""
@@ -308,7 +330,7 @@ class Agent:
         if others := [f"{f.name} ({human_size(f.size)})" for f, _ in files if not f.inline]:
             shown += _p("Attached: " + ", ".join(others))
         sig = self._sig()
-        if statement:  # a machine-read line (planning.py), last before the signature
+        if statement:  # a machine-read hold line, last before the signature
             shown += _p(statement)
         if text.endswith(sig):
             html_body = _md(text[: -len(sig)]) + shown + _signature(sig)
@@ -349,13 +371,14 @@ class Agent:
             msg = f"{e}; removed {len(made) - len(left)} of {len(made)} attachment(s)"
             raise WriteFailed(msg + (f"; could not remove: {', '.join(left)}" if left else "")) from e
 
-    def _statement(self, proj: Project, item: dict, text: str, statement: str) -> None:
-        """A comment whose last paragraph before the signature is a plan or actual statement (planning.py)."""
-        body = _md(text) if text.strip() else ""
-        self.client.add_comment(proj.id, item["id"], body + _p(statement) + _signature(self._sig()))
-
     def __post_init__(self) -> None:
         check_slug(self.slug)
+        if self.tz:
+            try:
+                ZoneInfo(self.tz)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ProtocolRefusal(f"timezone {self.tz!r} is not an IANA time zone, e.g. Europe/Madrid",
+                                      EXIT_REFUSED) from None  # fmt: skip
 
     @property
     def label(self) -> str:
@@ -408,14 +431,8 @@ class Agent:
 
     # -- bootstrap ---------------------------------------------------------
 
-    def bootstrap_project(self, identifier: str, tz: str) -> list[str]:
-        """Shape a project's states and labels to the protocol and check its time zone and cycles. Idempotent;
-        returns the changes made. The agent account should be a Member and can't change project settings, so a
-        wrong zone or cycles left off are refused after the rest is done, naming the fix for a project admin."""
-        try:
-            ZoneInfo(tz or "")
-        except (ZoneInfoNotFoundError, ValueError):
-            raise ProtocolRefusal(f"timezone (PLANE_TZ) must name an IANA time zone, e.g. Europe/Madrid (got {tz!r})", EXIT_REFUSED) from None
+    def bootstrap_project(self, identifier: str) -> list[str]:
+        """Shape a project's states and labels to the protocol. Idempotent; returns the changes made."""
         proj = self.project(identifier)
         changes: list[str] = []
         states = proj.states
@@ -457,19 +474,6 @@ class Agent:
             if name not in proj.labels:
                 proj.labels[name] = self.client.create_label(proj.id, {"name": name, "color": color})
                 changes.append(f"created label {name}")
-        wrong = []
-        if proj.tz != tz:
-            wrong.append(f"time zone is {proj.tz}, not {tz}")
-        if not proj.cycle_view:
-            wrong.append("cycles are off")
-        if wrong:
-            done = f" (done: {'; '.join(changes)})" if changes else ""
-            raise ProtocolRefusal(
-                f"project {proj.identifier}: {' and '.join(wrong)}. The agent account shouldn't change project "
-                f"settings, so a project admin does it in the Plane UI: Project settings > Features > Cycles on, and "
-                f"Project settings > General > Timezone {tz}. Then bootstrap again{done}",
-                EXIT_REFUSED,
-            )
         return changes
 
     # -- queue -------------------------------------------------------------
@@ -504,9 +508,9 @@ class Agent:
             out[it["id"]] = it
         return out
 
-    def queue(self, identifier: str, sweep: bool) -> tuple[list[dict], list[dict], list[str]]:
-        """Claimable items in protocol order, the claimable items still unplanned (no target date, so dispatch
-        would refuse them), and a log of sweep actions."""
+    def queue(self, identifier: str, sweep: bool) -> tuple[list[dict], list[str]]:
+        """Claimable items in protocol order (priority, then target date, then creation) and a log of sweep
+        actions."""
         proj = self.project(identifier)
         items = self._open_items(proj)
         log: list[str] = []
@@ -531,8 +535,7 @@ class Agent:
         claimable.sort(key=lambda i: (PRIORITY_RANK.get(i.get("priority"), 4), i.get("target_date") or "9999",
                                       _ts(i["created_at"])))  # fmt: skip
         self._seen[proj.identifier] = items
-        unplanned = [i for i in claimable if not i.get("target_date")]
-        return [i for i in claimable if i.get("target_date")], unplanned, log
+        return claimable, log
 
     def _release(self, proj: Project, it: dict, items: dict[str, dict]) -> str | None:
         """Sweep one Blocked item: back to where it was held from once every blocker is closed and any wait has
@@ -552,7 +555,7 @@ class Agent:
             until = hold[1] if hold else None
             if until is None:
                 return f"{ref}: labelled {WAITING} with no wait date on record; left alone"
-            if self.today(proj) <= until:
+            if self.today() <= until:
                 return None  # a known wait
             why = f"the wait until {until} has expired" + (", and every blocker is closed" if blockers else "")
         fresh = self.reread(proj, it)
@@ -583,7 +586,7 @@ class Agent:
         last update, and items past their target date."""
         proj = self.project(identifier)
         items = self._items(proj)
-        today, cutoff = self.today(proj), self.now() - timedelta(hours=REVIEW_STALE_H)
+        today, cutoff = self.today(), self.now() - timedelta(hours=REVIEW_STALE_H)
         ir = proj.state_id("In Review")
         out: dict[str, list[dict]] = {"deploy_review": [], "needs_human": [], "review_old": [], "overdue": []}
         for it in sorted(items.values(), key=lambda i: i["sequence_id"]):
@@ -609,7 +612,7 @@ class Agent:
             if it["state"] == proj.state_id("Blocked") and wid in (it.get("labels") or []):
                 hold = latest_hold(self.client.comments(proj.id, it["id"]))
                 until = hold[1] if hold else None
-                if until is None or until < self.today(proj):
+                if until is None or until < self.today():
                     out.append((it, until))
         return out
 
@@ -656,11 +659,6 @@ class Agent:
                 f"{ref} still carries {NEEDS_HUMAN}; the operator removes it when the question is answered",
                 EXIT_REFUSED,
             )
-        ps = plans(self.client.comments(proj.id, item["id"]))
-        if baseline(ps) is None:
-            raise ProtocolRefusal(
-                f"{ref} has no plan; run `plan {ref} --estimate H --target YYYY-MM-DD` first", EXIT_REFUSED
-            )
         self._refuse_busy(proj, to)
         lid = self._agent_label_id(proj, to)
         others = [i for i in item.get("labels") or [] if i not in {lb["id"] for n, lb in proj.labels.items()
@@ -675,10 +673,8 @@ class Agent:
             or self._agent_labels(proj, fresh) != {AGENT_PREFIX + to}
         ):
             raise ProtocolRefusal(f"dispatch of {ref} was overwritten; re-check the item", EXIT_NOT_CLAIMABLE)
-        cur = latest(ps)
-        est = latest_estimate([p for p in ps if not p.posthoc])
-        plan = f" Plan: {hours(est)} h by {cur.target}." if cur and est is not None else ""
-        self.comment(proj, item, f"Dispatched to agent:{to}.{plan}\n\n{self._sig()}")
+        target = f" Target {fresh['target_date'][:10]}." if fresh.get("target_date") else ""
+        self.comment(proj, item, f"Dispatched to agent:{to}.{target}\n\n{self._sig()}")
         return fresh
 
     def _refuse_busy(self, proj: Project, slug: str) -> None:
@@ -693,7 +689,7 @@ class Agent:
 
     def claim(self, ref: str) -> dict:
         """Worker start: confirm the item was dispatched to me and post the one-line claim comment. Its signature
-        records the holding session, which `report` uses to tell the holder's own comments apart."""
+        records the holding session, which later writes are checked against."""
         proj, item = self._owned(ref)
         self.comment(proj, item, f"Claimed by agent:{self.slug}.\n\n{self._sig()}")
         return item
@@ -832,11 +828,8 @@ class Agent:
         check_body(text, "--wait")
         files = self._files(attach)
         proj, item, origin = self._blockable(ref)
-        today = self.today(proj)
-        try:
-            day = parse_day(until, "--until") or today + timedelta(days=WAIT_DAYS)
-        except PlanError as e:
-            raise ProtocolRefusal(str(e), EXIT_REFUSED) from None
+        today = self.today()
+        day = parse_day(until, "--until") or today + timedelta(days=WAIT_DAYS)
         if day < today:
             raise ProtocolRefusal(f"--until {day} has passed; give a day from {today} on", EXIT_REFUSED)
         wid = self._ensure_label(proj, WAITING, dict(LABELS)[WAITING])
@@ -1078,8 +1071,8 @@ class Agent:
         return state
 
     def backlog(self, ref: str, reason: str) -> None:
-        """Ready -> Backlog for an item nobody holds: not dispatchable until it is promoted again. Its plan stays;
-        `plan REF --clear` withdraws that too."""
+        """Ready -> Backlog for an item nobody holds: not dispatchable until it is promoted again. Its dates stay;
+        `plan REF --clear` removes them."""
         if self.slug != ORCHESTRATOR:
             raise ProtocolRefusal("backlog is an orchestrator move", EXIT_REFUSED)
         if not reason.strip():
@@ -1140,105 +1133,46 @@ class Agent:
         self.client.update_item(proj.id, item["id"], {"state": proj.state_id("Cancelled")})
         self.comment(proj, item, f"Cancelled.\n\n{reason}\n\n{self._sig()}")
 
-    # -- plans and cycles (work-planning) ----------------------------------
+    # -- dates -------------------------------------------------------------
 
-    def _place(self, proj: Project, item: dict, day: date) -> str | None:
-        """Put the item in the ISO-week cycle holding `day`, creating the cycle if needed; Plane moves it out of any
-        other cycle. Returns a warning when Plane refuses because the week has ended (the item stays where it was)."""
-        name, monday, sunday = week_of(day)
-        cycle = cycle_for_week(self.client.cycles(proj.id), monday, sunday, proj.zone)
-        if cycle is None:
-            if sunday < self.today(proj):
-                return f"{proj.ref(item)} is not in a cycle: week {name} has ended and has none"
-            cycle = self.client.create_cycle(proj.id, name, monday.isoformat(), sunday.isoformat())
-        try:
-            self.client.add_cycle_items(proj.id, cycle["id"], [item["id"]])
-        except PlaneError as e:
-            if e.status != 400:
-                raise
-            return f"{proj.ref(item)} is not in cycle {cycle['name']}: it has ended, so Plane refused; left where it was"
-        return None
+    def _dates(self, item: dict, target: date | None, start: date | None, clear: bool = False) -> dict:
+        """The date fields to write: the ones given, checked against the ones kept. Refuses a start after the
+        target."""
+        if clear:
+            return {"start_date": None, "target_date": None}
+        body = {k: v.isoformat() for k, v in (("start_date", start), ("target_date", target)) if v is not None}
+        st = start or parse_day((item.get("start_date") or "")[:10], "start")
+        tg = target or parse_day((item.get("target_date") or "")[:10], "target")
+        if st and tg and st > tg:
+            raise ProtocolRefusal(f"start {st} is after target {tg}", EXIT_REFUSED)
+        return body
 
-    def _unplace(self, proj: Project, item: dict) -> None:
-        """Take an item out of its cycle (epics are never in one). Its cycle is only visible in its activity log."""
-        moves = sorted((a for a in self.client.activities(proj.id, item["id"]) if a.get("field") == "cycles"),
-                       key=lambda a: a["created_at"])  # fmt: skip
-        if moves and moves[-1].get("verb") != "deleted" and moves[-1].get("new_identifier"):
-            self.client.remove_cycle_item(proj.id, moves[-1]["new_identifier"], item["id"])
-
-    def _plan(self, proj: Project, item: dict, plan: Plan, text: str, epic: bool) -> str | None:
-        """Write a validated plan: native dates, the signed statement, and the cycle of its target."""
-        dates = {"start_date": plan.start.isoformat(), "target_date": plan.target.isoformat()}
-        if any(item.get(k) != v for k, v in dates.items()):
-            self.client.update_item(proj.id, item["id"], dates)
-        self._statement(proj, item, text, plan.statement())
-        return None if epic else self._place(proj, item, plan.target)
-
-    def plan(
-        self, ref: str, estimate: str | None = None, target: str | None = None, start: str | None = None,
-        reason: str = "",
-    ) -> tuple[Plan, str | None]:  # fmt: skip
-        """Give an item its plan (the baseline) or revise it. Returns the plan written and any cycle warning."""
+    def plan(self, ref: str, target: str | None = None, start: str | None = None, clear: bool = False,
+             reason: str = "") -> dict:  # fmt: skip
+        """Set or clear an open item's native start and target dates. Anyone may date an item nobody holds; a held
+        one is its holder's or the orchestrator's (exit 4 otherwise). A signed comment only with a reason. Returns
+        the dates written."""
+        if clear and (target or start):
+            raise ProtocolRefusal("plan --clear takes no --target or --start", EXIT_REFUSED)
+        if not clear and not (target or start):
+            raise ProtocolRefusal("plan needs --target, --start or --clear", EXIT_REFUSED)
+        check_body(reason, "--reason")
+        tgt, st = parse_day(target, "--target"), parse_day(start, "--start")
         proj, item = self.resolve(ref)
         if proj.group(item) in CLOSED_GROUPS:
-            raise ProtocolRefusal(f"{ref} is {proj.state_name(item)}; a closed item's plan can't change", EXIT_REFUSED)
+            raise ProtocolRefusal(f"{ref} is {proj.state_name(item)}; a closed item's dates don't change", EXIT_REFUSED)
         holders = self._agent_labels(proj, item)
         if holders and proj.group(item) == "started" and self.slug != ORCHESTRATOR and self.label not in holders:
             raise ProtocolRefusal(f"{ref} is held by {', '.join(sorted(holders))}; only it or the orchestrator "
-                                  "revises its plan", EXIT_OWNERSHIP_LOST)  # fmt: skip
-        epic = bool(self._children(proj, item))
-        comments = self.client.comments(proj.id, item["id"])
-        ps = plans(comments)
-        real = [p for p in ps if not p.posthoc]
-        gone = last_rev(comments) if not real else None  # a withdrawn plan: the next one is a fresh baseline
-        try:
-            est, tgt, st = parse_estimate(estimate), parse_day(target, "--target"), parse_day(start, "--start")
-            if not real:
-                if tgt is None:
-                    raise PlanError("a plan needs --target")
-                if est is None and not epic:
-                    raise PlanError("a plan needs --estimate (only epics may go without)")
-                rev = 0 if gone is None else gone + 1
-                plan = Plan(rev, est, st or self.today(proj), tgt)
-                text = f"Planned: {hours(est)} h by {tgt}." if est else f"Planned: by {tgt}."
-                if gone is not None:
-                    text = f"Planned again after a withdrawn plan: {text.removeprefix('Planned: ')}"
-            else:
-                if not reason.strip():
-                    raise PlanError(f"{ref} already has a plan; a revision needs --reason")
-                check_body(reason, "--reason")
-                cur = latest(real)
-                st = st or parse_day(item.get("start_date"), "start") or cur.start
-                tgt = tgt or parse_day(item.get("target_date"), "target") or cur.target
-                est = est if est is not None else latest_estimate(real)
-                rev = max(p.rev for p in real) + 1
-                plan = Plan(rev, est, st, tgt)
-                text = f"Plan revision {rev}.\n\n{reason.strip()}"
-            check_dates(plan.start, plan.target)
-        except PlanError as e:
-            raise ProtocolRefusal(str(e), EXIT_REFUSED) from None
-        return plan, self._plan(proj, item, plan, text, epic)
-
-    def withdraw_plan(self, ref: str, reason: str) -> None:
-        """End a Backlog item's plan: no dates, no cycle, and a signed `plan: rev=N withdrawn` statement. Its history
-        stays; the next `plan` is a fresh baseline at rev N+1, and until then it has none (dispatch refuses it)."""
-        if self.slug != ORCHESTRATOR:
-            raise ProtocolRefusal("plan --clear is an orchestrator move", EXIT_REFUSED)
-        if not reason.strip():
-            raise ProtocolRefusal("--reason must say why the plan is withdrawn", EXIT_REFUSED)
-        check_body(reason, "--reason")
-        proj, item = self.resolve(ref)
-        if proj.state_name(item) != "Backlog":
-            raise ProtocolRefusal(f"{ref} is {proj.state_name(item)}; only a Backlog item's plan is withdrawn "
-                                  "(`backlog REF --reason` first for a Ready one)", EXIT_REFUSED)  # fmt: skip
-        comments = self.client.comments(proj.id, item["id"])
-        real = [p for p in plans(comments) if not p.posthoc]
-        if not real:
-            raise ProtocolRefusal(f"{ref} has no plan to withdraw", EXIT_REFUSED)
-        if item.get("start_date") or item.get("target_date"):
-            self.client.update_item(proj.id, item["id"], {"start_date": None, "target_date": None})
-        self._unplace(proj, item)
-        self._statement(proj, item, f"Plan withdrawn.\n\n{reason.strip()}", withdrawal_statement(max(p.rev for p in real)))
+                                  "changes its dates", EXIT_OWNERSHIP_LOST)  # fmt: skip
+        body = self._dates(item, tgt, st, clear)
+        if any(item.get(k) != v for k, v in body.items()):
+            self.client.update_item(proj.id, item["id"], body)
+        if reason.strip():
+            what = "Dates cleared." if clear else "Dates: " + ", ".join(
+                f"{k.removesuffix('_date')} {v}" for k, v in body.items()) + "."  # fmt: skip
+            self.comment(proj, item, f"{what}\n\n{reason.strip()}\n\n{self._sig()}")
+        return body
 
     # -- create ------------------------------------------------------------
 
@@ -1252,32 +1186,21 @@ class Agent:
         priority: str = "none",
         ready: bool = False,
         blocked_by: list[str] | None = None,
-        estimate: str | None = None,
         start: str | None = None,
         target: str | None = None,
     ) -> dict:
-        """Create an item; with --estimate and --target it is planned (baseline) and placed in its week's cycle. The
-        returned item carries `warning` when the cycle refused it."""
+        """Create an item, with its native start and target dates when given."""
         if kind not in KINDS:
             raise ProtocolRefusal(f"kind must be one of {KINDS}", EXIT_REFUSED)
         proj = self.project(identifier)
-        try:
-            est, tgt, st = parse_estimate(estimate), parse_day(target, "--target"), parse_day(start, "--start")
-            if est is not None and tgt is None:
-                raise PlanError("--estimate needs --target")
-            if tgt is not None:
-                st = st or self.today(proj)
-                check_dates(st, tgt)
-        except PlanError as e:
-            raise ProtocolRefusal(str(e), EXIT_REFUSED) from None
+        dates = self._dates({}, parse_day(target, "--target"), parse_day(start, "--start"))
         body: dict = {
             "name": name,
             "labels": [proj.label_id(f"kind:{kind}")],
             "priority": priority,
             "state": proj.state_id("Ready" if ready else "Backlog"),
+            **dates,
         }
-        if tgt is not None:
-            body.update(start_date=st.isoformat(), target_date=tgt.isoformat())
         if self.change:
             description = f"{description}\n\n**OpenSpec change:** `{self.change}`".strip()
         if description:
@@ -1291,60 +1214,7 @@ class Agent:
             if self._would_cycle(proj, item["id"], ids):
                 raise ProtocolRefusal("blocked_by would create a cycle", EXIT_REFUSED)
             self.client.add_relation(proj.id, item["id"], "blocked_by", ids)
-        if parent_item:
-            self._unplace(proj, parent_item)  # it is an epic now
-        if est is not None:
-            plan = Plan(0, est, st, tgt)
-            item = {**item, "warning": self._plan(proj, item, plan, f"Planned: {hours(est)} h by {tgt}.", False)}
         return item
-
-    # -- retroactive logs ----------------------------------------------------
-
-    def log(
-        self, identifier: str, name: str, kind: str, started: str, ended: str, summary: str,
-        estimate: str | None = None, parent: str | None = None,
-    ) -> dict:  # fmt: skip
-        """File work already done, with its real times: Done (In Review for deploy items), labelled retro and
-        agent:<slug>, the times in a signed `actual:` statement. An estimate given now is post-hoc, never a
-        baseline. The returned item carries `warning` when its week's cycle refused it."""
-        if kind not in KINDS:
-            raise ProtocolRefusal(f"kind must be one of {KINDS}", EXIT_REFUSED)
-        if not summary.strip():
-            raise ProtocolRefusal("--summary must say what was done", EXIT_REFUSED)
-        check_body(summary, "--summary")
-        proj = self.project(identifier)
-        zone = proj.zone
-        try:
-            t0 = parse_moment(started, zone, "--started").astimezone(zone)
-            t1 = parse_moment(ended, zone, "--ended").astimezone(zone)
-            est = parse_estimate(estimate)
-            if t1 <= t0:
-                raise PlanError("--ended must be after --started")
-            if t1 > self.now():
-                raise PlanError("--ended is in the future; log work once it is done")
-        except PlanError as e:
-            raise ProtocolRefusal(str(e), EXIT_REFUSED) from None
-        labels = [proj.label_id(f"kind:{kind}"), proj.label_id(RETRO), self._agent_label_id(proj, self.slug)]
-        parent_item = self.resolve(parent)[1] if parent else None
-        body: dict = {"name": name, "labels": labels, "priority": "none", "state": proj.state_id("Backlog"),
-                      "assignees": [self.me["id"]], "start_date": t0.date().isoformat(),
-                      "target_date": t1.date().isoformat()}  # fmt: skip
-        if self.change:
-            body["description_html"] = _md(f"**OpenSpec change:** `{self.change}`")
-        if parent_item:
-            body["parent"] = parent_item["id"]
-        item = self.client.create_item(proj.id, body)
-        span = hours(round((t1 - t0).total_seconds() / 3600, 2))
-        self._statement(proj, item, f"Logged after the fact: worked {t0:%Y-%m-%d %H:%M} to {t1:%Y-%m-%d %H:%M} "
-                                    f"({span} h).\n\n{summary}", actual_statement(t0, t1))  # fmt: skip
-        if est is not None:
-            plan = Plan(0, est, t0.date(), t1.date(), posthoc=True)
-            self._statement(proj, item, "Estimate given after the work: post-hoc, not a baseline.", plan.statement())
-        state = "In Review" if kind == "deploy" else "Done"
-        self.client.update_item(proj.id, item["id"], {"state": proj.state_id(state)})
-        if parent_item:
-            self._unplace(proj, parent_item)
-        return {**item, "state_name": state, "warning": self._place(proj, item, t1.date())}
 
     # -- stale -------------------------------------------------------------
 
@@ -1403,12 +1273,10 @@ class Agent:
             raise ProtocolRefusal(f"{ref} changed while reclaiming it; re-check the item", EXIT_REFUSED)
         return slug
 
-    def stale(self, identifier: str, hours: float, reclaim: bool) -> list[tuple[dict, str, datetime | None]]:
-        """Agent-held items whose agent has been silent for `hours`. An item with several agent: labels is reported
-        with last=None and never reclaimed: no agent can write to it, so the operator has to fix the labels."""
-        if reclaim and hours < RECLAIM_FLOOR_H:
-            raise ProtocolRefusal(f"stale --reclaim needs --hours >= {RECLAIM_FLOOR_H}; take one item back early "
-                                  "with `reclaim REF --reason`", EXIT_REFUSED)  # fmt: skip
+    def stale(self, identifier: str, hours: float) -> list[tuple[dict, str, datetime | None]]:
+        """Agent-held items whose agent has been silent for `hours`; it lists, never moves (`reclaim REF` takes one
+        back). An item with several agent: labels is reported with last=None: no agent can write to it, so the
+        operator has to fix the labels."""
         proj = self.project(identifier)
         in_progress = proj.state_id("In Progress")
         cutoff = self.now() - timedelta(hours=hours)
@@ -1428,8 +1296,4 @@ class Agent:
             last = self._last_agent_activity(proj, it, slug)
             if last < cutoff:
                 found.append((it, slug, last))
-                if reclaim:
-                    self._take_back(proj, it, f"Reclaimed from agent:{slug}: no activity by it since "
-                                              f"{last.isoformat(timespec='minutes')} (>{hours:g} h). Returned to "
-                                              "Ready, unassigned.")  # fmt: skip
         return found

@@ -36,7 +36,6 @@ class PlaneClient:
         timeout: float = 20.0,
         sleep: Callable[[float], None] = time.sleep,
         max_wait: float = 180.0,
-        clock: Callable[[], float] = time.monotonic,
         rate_limit: int = 60,
         wall: Callable[[], float] = time.time,
     ):
@@ -46,12 +45,8 @@ class PlaneClient:
         self.rate_limit = rate_limit  # calls a minute the server allows this token (all agents share it)
         self._wall = wall
         self._sleep = sleep
-        self._clock = clock
         self._max_wait = max_wait  # total seconds one call may spend waiting out 429s
         self.calls = 0  # requests sent, retries included
-        self._pace_after: int | None = None
-        self._gap = 0.0
-        self._last = 0.0
         self._transport = transport  # the presigned upload client reuses it (tests)
         self._timeout = timeout
         self._http = httpx.Client(
@@ -66,31 +61,9 @@ class PlaneClient:
     def item_url(self, ref: str) -> str:
         return f"{self.web_url}/{self.workspace}/browse/{ref}/"
 
-    def pace(self, after: int | None = None, per_minute: int | None = None) -> None:
-        """Past `after` requests (default 40% of the limit), space them to stay under `per_minute` (default 5/6 of
-        it), leaving the shared budget room for the other agents. Long reads (report) turn this on."""
-        after = int(self.rate_limit * 0.4) if after is None else after
-        per_minute = max(1, self.rate_limit * 5 // 6) if per_minute is None else per_minute
-        self._pace_after = self.calls + after
-        self._gap = 60.0 / per_minute
-
     def _send(self, method: str, path: str, **kw: Any) -> httpx.Response:
-        if self._pace_after is not None and self.calls >= self._pace_after:
-            wait = self._last + self._gap - self._clock()
-            if wait > 0:
-                self._sleep(wait)
         self.calls += 1
-        self._last = self._clock()
-        r = self._http.request(method, path, **kw)
-        if self._pace_after is not None and r.status_code != 429:
-            # Paced reads also heed the server's count: other agents spend the same budget.
-            try:
-                left = int(r.headers["X-RateLimit-Remaining"])
-            except (KeyError, ValueError):
-                return r
-            if left <= max(2, self.rate_limit // 10):
-                self._sleep(self._retry_delay(r))
-        return r
+        return self._http.request(method, path, **kw)
 
     def _req(self, method: str, path: str, **kw: Any) -> Any:
         # Every agent shares one token, so one budget (rate_limit calls a minute). A throttled request is
@@ -210,27 +183,6 @@ class PlaneClient:
 
     def comments(self, project_id: str, item_id: str) -> list[dict]:
         return list(self._paged(self._proj(project_id, f"work-items/{item_id}/comments/")))
-
-    # -- cycles ------------------------------------------------------------
-    # Checked live (add-plan-vs-actual task 1.2): POST cycle-issues moves an item out of any other cycle; an
-    # ended cycle answers 400 CYCLE_COMPLETED. Project settings (cycle_view, timezone) need an Admin, which the
-    # agent account isn't, so there is no project update here.
-
-    def cycles(self, project_id: str) -> list[dict]:
-        return list(self._paged(self._proj(project_id, "cycles/")))
-
-    def create_cycle(self, project_id: str, name: str, start: str, end: str) -> dict:
-        body = {"name": name, "start_date": start, "end_date": end}
-        return self._req("POST", self._proj(project_id, "cycles/"), json=body)
-
-    def cycle_items(self, project_id: str, cycle_id: str) -> list[dict]:
-        return list(self._paged(self._proj(project_id, f"cycles/{cycle_id}/cycle-issues/")))
-
-    def add_cycle_items(self, project_id: str, cycle_id: str, item_ids: list[str]) -> Any:
-        return self._req("POST", self._proj(project_id, f"cycles/{cycle_id}/cycle-issues/"), json={"issues": item_ids})
-
-    def remove_cycle_item(self, project_id: str, cycle_id: str, item_id: str) -> None:
-        self._req("DELETE", self._proj(project_id, f"cycles/{cycle_id}/cycle-issues/{item_id}/"))
 
     # -- attachments -------------------------------------------------------
 

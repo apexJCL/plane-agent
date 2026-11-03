@@ -1,6 +1,6 @@
 [project]
 name = "plane-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Coordinate an orchestrator and its AI subagents through a Plane tracker (Plane Cloud or self-hosted)"
 readme = "README.md"
 license = "MIT"

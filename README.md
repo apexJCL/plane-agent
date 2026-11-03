@@ -7,8 +7,8 @@ Long-running agent work loses its thread: sessions end, context is compacted, tw
 - **One shared agent account, many agents.** Agents differ by *slug* (`api-implementation`, `docs-writer`); an `agent:<slug>` label says who holds an item, and every comment is signed `agent=<slug> · session=… · where=repo@branch`.
 - **A strict protocol** over seven states (Backlog, Ready, In Progress, Blocked, In Review, Done, Cancelled): the orchestrator dispatches, a worker claims, checks it still holds the item before risky steps, blocks on other items or on the human (`needs-human`), and hands off for review. Writes are refused (exit 4) the moment an agent no longer holds its item.
 - **A trail to resume from.** `context PROJ-12` returns the description, blockers, attachments and signed comments, so a fresh session picks up where the last one stopped.
-- **Plans vs actuals.** Every item gets an hour estimate and dates before dispatch, lands in its week's cycle, and `report` compares the baseline against active time from state changes, with an optional burndown.
-- **Human gates.** Deploy items and `needs-human` items only close by the human's hand; stale items are found and reclaimed.
+- **Dates, not plans.** Items carry Plane's native start and target dates (`create --target`, `plan REF --target`); the queue orders by priority, then target date, and flags what is overdue.
+- **Human gates.** Deploy items and `needs-human` items only close by the human's hand; `stale` lists items whose holder went quiet, and `reclaim REF` takes one back.
 
 It ships as a **Claude Code plugin** (the `tracker` skill that teaches agents the protocol) plus the **`plane-agent` CLI** (Python, any agent runtime that can run a shell command can use it).
 
@@ -35,10 +35,10 @@ Not using Claude Code? The protocol the skill teaches is plain markdown in [`ski
 
    ```sh
    # Plane Cloud (untested, see Compatibility; an app.plane.so URL is mapped to api.plane.so)
-   plane-agent init --url https://api.plane.so --workspace acme --project WEB --timezone Europe/Madrid
+   plane-agent init --url https://api.plane.so --workspace acme --project WEB
 
    # self-hosted (set --rate-limit if you changed API_KEY_RATE_LIMIT from its default of 60/minute)
-   plane-agent init --url https://plane.example.com --workspace acme --project WEB --timezone Europe/Madrid
+   plane-agent init --url https://plane.example.com --workspace acme --project WEB
    ```
 
    This writes `.plane-agent.toml` at the repository root. It holds no secrets; commit it. Add `--user` to write your user-level defaults (`~/.config/plane-agent/config.toml`) instead.
@@ -57,13 +57,11 @@ Not using Claude Code? The protocol the skill teaches is plain markdown in [`ski
    plane-agent --agent orchestrator whoami
    ```
 
-   `bootstrap-project` also checks that the project has **Cycles** turned on and the **time zone** you configured; if not, it tells you what to change in *Project settings* (a project admin does this, not the agent account).
-
 ## Use it
 
 ```sh
 export PLANE_AGENT=orchestrator
-plane-agent create "Add rate-limit headers" --kind feature --estimate 3h --target 2026-11-06 --ready
+plane-agent create "Add rate-limit headers" --kind feature --target 2026-11-06 --ready
 plane-agent queue                                     # dispatchable items, in order
 plane-agent dispatch WEB-12 --to api-implementation   # then start the subagent with that slug and WEB-12
 
@@ -78,10 +76,9 @@ EOF
 
 # back in the orchestrator
 plane-agent accept WEB-12
-plane-agent report --burndown
 ```
 
-Other moves: `block --wait TEXT --until DATE` (waiting on time or an outside party), `ready` (release a Blocked item), `backlog`, `prioritize`, `plan --clear` (withdraw a plan), `rework` (send an item In Review back to its holder), `review --for SLUG` (hand over for an agent that went silent), and `stale` (stale holds, expired waits, items long In Review). `queue` and `stale` end with a one-line stderr footer: deploy items waiting on the operator, needs-human items, and the count past their target date.
+Other moves: `block --wait TEXT --until DATE` (waiting on time or an outside party), `ready` (release a Blocked item), `backlog`, `prioritize`, `plan REF --target DATE` (move dates; `--clear` drops them), `rework` (send an item In Review back to its holder), `review --for SLUG` (hand over for an agent that went silent), and `stale` (lists stale holds, expired waits, items long In Review), `reclaim REF` (take an item back). `queue` and `stale` end with a one-line stderr footer: deploy items waiting on the operator, needs-human items, and the count past their target date.
 
 `plane-agent --help` and `plane-agent VERB --help` list every verb; the skill documents the full protocol, exit codes and formatting rules.
 
@@ -93,8 +90,8 @@ Settings, highest precedence first: environment → nearest `.plane-agent.toml` 
 |---|---|---|---|
 | `base_url` | `PLANE_BASE_URL` | `https://api.plane.so` | instance URL |
 | `workspace` | `PLANE_WORKSPACE_SLUG` | — | from the workspace URL, `https://<host>/<slug>/…` |
-| `project` | `PLANE_PROJECT` | — | default project key for `queue`, `report`, `stale`, `create`, `log`, `bootstrap-project` |
-| `timezone` | `PLANE_TZ` | — | the project's IANA zone; dates and weekly cycles use it |
+| `project` | `PLANE_PROJECT` | — | default project key for `queue`, `stale`, `create`, `bootstrap-project` |
+| `timezone` | `PLANE_TZ` | this machine's zone | IANA zone that decides "today" for overdue items and `--until` waits |
 | `rate_limit` | `PLANE_RATE_LIMIT` | `60` | API calls a minute the instance allows the token |
 
 Per-agent: `PLANE_AGENT` (slug), `PLANE_AGENT_SESSION` (run id in signatures; every write needs one, or `--session`), `PLANE_OPENSPEC_CHANGE` (optional: links an [OpenSpec](https://github.com/Fission-AI/OpenSpec) change in signatures and descriptions).
@@ -155,13 +152,14 @@ A token is always tied to the instance it belongs to. A repository's `.plane-age
 
 ### Rate limit
 
-Every agent shares the agent account's token, so they share one budget. On a 429 the CLI waits as the server asks (`Retry-After`, else `X-RateLimit-Reset`) and gives up after about 3 minutes; `report` paces itself under the limit, slows down when the server's `X-RateLimit-Remaining` runs low, and on a 60-a-minute limit stops after 100 calls (`--max-calls N` changes that; `0` means no cap) and marks the output as partial. At Plane Cloud's 60 a minute, a large report or a batch of `create --blocked-by` takes minutes — that's expected.
+Every agent shares the agent account's token, so they share one budget. On a 429 the CLI waits as the server asks (`Retry-After`, else `X-RateLimit-Reset`) and gives up after about 3 minutes. At Plane Cloud's 60 a minute, a batch of `create --blocked-by` can take a while; that's expected.
 
 ## Compatibility
 
 - **Self-hosted Plane CE v1.4.2**: developed and used against it daily; the test suite fakes its API.
-- **Plane Cloud: untested.** The CLI uses the same `/api/v1` routes per Plane's API reference (work items, comments, relations, cycles, `work-items/<id>/attachments/`), with its 60/minute limit as the default, but no release has been run against it; `init` and `config` say so. If you try it, [docs/cloud-checklist.md](docs/cloud-checklist.md) lists what to check, and please open an issue with what you find.
-- Project time zone and Cycles are project settings the agent account can't change; the operator sets them once.
+- **Plane Cloud: untested.** The CLI uses the same `/api/v1` routes per Plane's API reference (work items, comments, relations, `work-items/<id>/attachments/`), with its 60/minute limit as the default, but no release has been run against it; `init` and `config` say so. If you try it, [docs/cloud-checklist.md](docs/cloud-checklist.md) lists what to check, and please open an issue with what you find.
+
+Upgrading from 0.2? See [CHANGELOG.md](CHANGELOG.md): 0.3.0 removed the planning layer.
 
 ## Development
 

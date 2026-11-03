@@ -1,7 +1,7 @@
 {
   "name": "plane-agent",
-  "version": "0.2.0",
-  "description": "Coordinate an orchestrator and its subagents through a Plane tracker (Cloud or self-hosted): dispatch, claim, block, hand off, review and plan work with a durable, signed trail.",
+  "version": "0.3.0",
+  "description": "Coordinate an orchestrator and its subagents through a Plane tracker (Cloud or self-hosted): dispatch, claim, block, hand off and review work with a durable, signed trail.",
   "author": { "name": "apexJCL" },
   "homepage": "https://github.com/apexJCL/plane-agent",
   "repository": "https://github.com/apexJCL/plane-agent",

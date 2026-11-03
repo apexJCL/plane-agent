@@ -8,7 +8,7 @@ import sys
 
 from plane_agent.notify import notifier
 
-from .test_planning import _cli
+from .conftest import cli_runner as _cli
 from .test_protocol import ref, started
 from .test_triage import _deploy, _sweep
 

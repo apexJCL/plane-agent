@@ -13,13 +13,14 @@ import pytest
 
 from plane_agent import attachments, cli
 from plane_agent.client import PlaneClient
-from plane_agent.planning import is_statement, tail_statement
 from plane_agent.protocol import (
     EXIT_OWNERSHIP_LOST,
     EXIT_REFUSED,
     ProtocolRefusal,
     WriteFailed,
+    latest_hold,
     signed_by,
+    tail_statement,
 )
 
 from .conftest import agent
@@ -188,7 +189,7 @@ def test_log_file_is_named(fake, orch, files):
     assert [a["attributes"]["name"] for a in fake.attachments] == ["build.log", "s.png"]
     assert re.search(r"</image-component><p>Attached: build\.log \(3 KB\)</p><hr><p>agent=api ", body)
     tail = tail_statement(body)
-    assert signed_by(body, "api") and (tail is None or not is_statement(tail[0]))
+    assert signed_by(body, "api") and (tail is None or latest_hold([{"comment_html": body, "created_at": "x"}]) is None)
     plain = comments_on(fake, it)[-1].replace(re.search(r"<image-component.*?</image-component>", body)[0], "")
     assert tail_statement(plain)[0].startswith("Attached:")  # the Attached paragraph is never a statement
 

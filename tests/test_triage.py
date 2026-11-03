@@ -1,17 +1,15 @@
-"""Waits, holds and triage moves (block --wait, ready on Blocked, backlog, prioritize, plan --clear), and the
-operator's attention list, against FakePlane."""
+"""Waits, holds and triage moves (block --wait, ready on Blocked, backlog, prioritize), and the operator's
+attention list, against FakePlane."""
 
 from __future__ import annotations
 
 import pytest
 
-from plane_agent.planning import baseline, plans
 from plane_agent.protocol import EXIT_OWNERSHIP_LOST, EXIT_REFUSED, NEEDS_HUMAN, WAITING, ProtocolRefusal
-from plane_agent.report import report
 
 from .conftest import agent
-from .test_planning import _cli
-from .test_protocol import comments_on, label_names, planned, ref, started, state_name
+from .conftest import cli_runner as _cli
+from .test_protocol import comments_on, label_names, ref, started, state_name
 
 
 def _refused(call, *args, code=EXIT_REFUSED, match=""):
@@ -22,7 +20,7 @@ def _refused(call, *args, code=EXIT_REFUSED, match=""):
 
 
 def _sweep(orch):
-    return orch.queue("HOME", sweep=True)[2]
+    return orch.queue("HOME", sweep=True)[1]
 
 
 def _deploy(fake, orch, name="ship it"):
@@ -200,55 +198,10 @@ def test_queue_orders_by_priority_then_target_then_age(fake, orch):
     soon = fake.seed_item(fake.pid, "soon", "Ready")
     fake.tick(minutes=1)
     hot = fake.seed_item(fake.pid, "hot", "Ready", priority="high")
-    orch.plan(ref(late), "1h", target="2026-10-16")
-    orch.plan(ref(soon), "1h", target="2026-10-09")
-    orch.plan(ref(hot), "1h", target="2026-10-30")
+    orch.plan(ref(late), target="2026-10-16")
+    orch.plan(ref(soon), target="2026-10-09")
+    orch.plan(ref(hot), target="2026-10-30")
     assert [i["name"] for i in orch.queue("HOME", sweep=False)[0]] == ["hot", "soon", "late"]
-
-
-# -- plan withdrawal ---------------------------------------------------------
-
-
-def test_plan_clear_withdraws_and_the_next_plan_is_a_fresh_baseline(fake, orch):
-    it = fake.seed_item(fake.pid, "maybe", "Backlog")
-    orch.plan(ref(it), "4h", target="2026-10-09")
-    assert it["id"] in fake.cycle_of
-    orch.withdraw_plan(ref(it), "no date we can stand behind")
-    assert it["start_date"] is None and it["target_date"] is None and it["id"] not in fake.cycle_of
-    assert "plan: rev=0 withdrawn" in comments_on(fake, it)[-1] and "Plan withdrawn." in comments_on(fake, it)[-1]
-    cs = orch.client.comments(fake.pid, it["id"])
-    assert plans(cs) == [] and baseline(plans(cs)) is None
-    orch.ready(ref(it))
-    _refused(orch.dispatch, ref(it), "api", match="has no plan")
-    plan, _ = orch.plan(ref(it), "6h", target="2026-10-16")
-    assert plan.rev == 1 and "plan: rev=1 estimate=6h" in comments_on(fake, it)[-1]
-    assert "Planned again after a withdrawn plan" in comments_on(fake, it)[-1]
-    assert baseline(plans(orch.client.comments(fake.pid, it["id"]))).estimate == 6
-    assert "plan: rev=0 estimate=4h" in comments_on(fake, it)[0]  # history stays
-    orch.dispatch(ref(it), "api")
-
-
-def test_plan_clear_refusals(fake, orch):
-    ready = fake.seed_item(fake.pid, "r", "Ready")
-    planned(orch, ready)
-    _refused(orch.withdraw_plan, ref(ready), "x", match="only a Backlog item")
-    bare = fake.seed_item(fake.pid, "b", "Backlog")
-    _refused(orch.withdraw_plan, ref(bare), "x", match="no plan to withdraw")
-    _refused(orch.withdraw_plan, ref(bare), "", match="--reason")
-    _refused(agent(fake, "api").withdraw_plan, ref(bare), "x", match="orchestrator move")
-    orch.backlog(ref(ready), "later")
-    orch.withdraw_plan(ref(ready), "later")
-    _refused(orch.withdraw_plan, ref(ready), "again", match="no plan to withdraw")
-
-
-def test_report_does_not_count_a_withdrawn_plan(fake, orch):
-    it = fake.seed_item(fake.pid, "dropped plan", "Backlog")
-    orch.plan(ref(it), "4h", target="2026-10-09")
-    orch.withdraw_plan(ref(it), "re-scoped")
-    it["state"] = fake.state(fake.pid, "Done")["id"]
-    it["completed_at"] = fake.clock.isoformat()
-    row = next(r for r in report(orch, "HOME", cycle="2026-W41")["rows"] if r["ref"] == ref(it))
-    assert row["baseline_h"] is None and "no plan" in row["flags"]
 
 
 # -- what waits on the operator ----------------------------------------------
@@ -261,7 +214,7 @@ def test_attention_and_expired_waits(fake, orch):
     old, w2 = started(fake, orch, "web", name="slow review")
     w2.review(ref(old), "")
     late = fake.seed_item(fake.pid, "late", "Ready")
-    orch.plan(ref(late), "1h", target="2026-10-07")
+    orch.plan(ref(late), target="2026-10-07")
     wt, w3 = started(fake, orch, "ops", name="waiting")
     w3.block_wait(ref(wt), "the ISP", until="2026-10-08")
     fake.tick(days=4)
@@ -282,8 +235,8 @@ def test_cli_triage_verbs(fake, orch, monkeypatch, capsys):
     assert run("ready", ref(it)) == 0 and state_name(fake, it) == "Ready"
     assert run("prioritize", ref(it), "high") == 0 and it["priority"] == "high"
     assert run("backlog", ref(it), "--reason", "later") == 0 and state_name(fake, it) == "Backlog"
-    assert run("plan", ref(it), "--estimate", "2h", "--target", "2026-10-09") == 0
-    assert run("plan", ref(it), "--clear", "--estimate", "2h", "--reason", "x") == 2
+    assert run("plan", ref(it), "--target", "2026-10-09") == 0 and it["target_date"] == "2026-10-09"
+    assert run("plan", ref(it), "--clear", "--target", "2026-10-09") == 2
     assert run("plan", ref(it), "--clear", "--reason", "re-scoped") == 0 and it["target_date"] is None
     capsys.readouterr()
     _deploy(fake, orch)
@@ -293,12 +246,11 @@ def test_cli_triage_verbs(fake, orch, monkeypatch, capsys):
     assert "waiting on the operator" in capsys.readouterr().err
 
 
-def test_cli_worker_may_not_withdraw_or_backlog(fake, orch, monkeypatch, capsys):
+def test_cli_worker_may_not_backlog(fake, orch, monkeypatch, capsys):
     from plane_agent import cli
 
     _cli(fake, monkeypatch)
     it = fake.seed_item(fake.pid, "a", "Ready")
     argv = ["--agent", "api", "--session", "t", "--where", "x"]
     assert cli.main([*argv, "backlog", ref(it), "--reason", "x"]) == 5
-    assert cli.main([*argv, "plan", ref(it), "--clear", "--reason", "x"]) == 5
     assert "orchestrator move" in capsys.readouterr().err

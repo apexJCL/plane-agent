@@ -1,13 +1,13 @@
 """Roles and review moves: rework, review --for, free roles in the busy-slug refusal, the agent-label warning, the
-plan in the dispatch comment, and the session-mismatch warning, against FakePlane."""
+target date in the dispatch comment, and the session-mismatch warning, against FakePlane."""
 
 from __future__ import annotations
 
 from plane_agent.protocol import EXIT_REFUSED, NEEDS_HUMAN
 
 from .conftest import agent
-from .test_planning import _cli
-from .test_protocol import comments_on, label_names, planned, ref, started, state_name
+from .conftest import cli_runner as _cli
+from .test_protocol import comments_on, label_names, ref, started, state_name
 from .test_triage import _deploy, _refused
 
 
@@ -20,7 +20,7 @@ def test_rework_returns_the_item_to_its_holder(fake, orch):
     assert label_names(fake, it) >= {"agent:api"}
     assert "Rework for agent:api:" in comments_on(fake, it)[-1]
     w.check(ref(it))  # the holder owns it again
-    assert orch.stale("HOME", 24, False) == []  # the rework comment restarts its stale clock
+    assert orch.stale("HOME", 24) == []  # the rework comment restarts its stale clock
     w.note(ref(it), "on it")
 
 
@@ -64,7 +64,7 @@ def test_busy_slug_refusal_lists_free_roles(fake, orch):
     done, w = started(fake, orch, "docs", name="d")
     w.review(ref(done), "")
     it = fake.seed_item(fake.pid, "next", "Ready")
-    msg = _refused(orch.dispatch, planned(orch, it), "api", code=EXIT_REFUSED)
+    msg = _refused(orch.dispatch, ref(it), "api", code=EXIT_REFUSED)
     assert "free roles: docs" in msg and "orchestrator" not in msg.split("free roles:")[1]
 
 
@@ -76,11 +76,14 @@ def test_many_agent_labels_warn_on_a_new_one(fake, orch):
     assert len(orch.notices) == 1
 
 
-def test_dispatch_comment_carries_the_plan(fake, orch):
+def test_dispatch_comment_carries_the_target(fake, orch):
     it = fake.seed_item(fake.pid, "a", "Ready")
-    orch.plan(ref(it), "3.5h", target="2026-10-09")
+    orch.plan(ref(it), target="2026-10-09")
     orch.dispatch(ref(it), "api")
-    assert "Dispatched to agent:api. Plan: 3.5 h by 2026-10-09." in comments_on(fake, it)[-1]
+    assert "Dispatched to agent:api. Target 2026-10-09." in comments_on(fake, it)[-1]
+    bare = fake.seed_item(fake.pid, "b", "Ready")
+    orch.dispatch(ref(bare), "web")
+    assert "Dispatched to agent:web.</p>" in comments_on(fake, bare)[-1]
 
 
 def test_signing_from_another_session_warns(fake, orch):

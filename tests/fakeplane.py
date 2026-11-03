@@ -1,8 +1,7 @@
 """In-memory stand-in for Plane CE v1.4.2's /api/v1, shaped after the v1.4.2 source:
 paginated envelopes (results/next_cursor/next_page_results), work-items by identifier, relations grouped by
 type (blocked_by stored on the blocked item, "blocking" derived), activities recorded with the actor for
-every change, cycles stored as UTC datetimes from local dates in the project's zone (moves between cycles,
-CYCLE_COMPLETED on ended ones), and X-API-Key auth. Attachments follow the three-step upload (create, presigned
+every change, and X-API-Key auth. Attachments follow the three-step upload (create, presigned
 POST to /uploads, PATCH is_uploaded); the presigned target sits outside the API and refuses an X-API-Key.
 """
 
@@ -14,8 +13,7 @@ import itertools
 import json
 import re
 import uuid
-from datetime import UTC, date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -40,8 +38,6 @@ class FakePlane:
         self.relations: list[dict] = []
         self.comments: list[dict] = []
         self.activities: list[dict] = []
-        self.cycles: dict[str, list[dict]] = {}
-        self.cycle_of: dict[str, str] = {}  # item id -> cycle id
         self.attachments: list[dict] = []
         self.uploads: list[dict] = []  # what the presigned target received: field order, fields, file
         self.fail_upload: int | None = None  # the Nth presigned upload (1-based) answers 500
@@ -63,11 +59,9 @@ class FakePlane:
     def uid(self, name: str) -> str:
         return next(u["id"] for u in self.users.values() if u["display_name"] == name)
 
-    def add_project(self, identifier: str, timezone: str = "America/Los_Angeles", cycle_view: bool = True) -> str:
+    def add_project(self, identifier: str) -> str:
         pid = str(uuid.uuid4())
-        self.projects[pid] = {"id": pid, "identifier": identifier, "name": identifier, "timezone": timezone,
-                              "cycle_view": cycle_view}  # fmt: skip
-        self.cycles[pid] = []
+        self.projects[pid] = {"id": pid, "identifier": identifier, "name": identifier, "timezone": "UTC"}
         self.states[pid] = [
             {"id": str(uuid.uuid4()), "name": n, "group": g, "default": d, "sequence": float((i + 1) * 15000),
              "color": "#000"}
@@ -118,17 +112,6 @@ class FakePlane:
                                 "verb": verb, "old_identifier": old_identifier, "new_identifier": new_identifier,
                                 "new_value": new_value, "created_at": self.clock.isoformat()})  # fmt: skip
 
-    def _cycle_dt(self, pid: str, day: str, at: time) -> str:
-        zone = ZoneInfo(self.projects[pid]["timezone"])
-        return datetime.combine(date.fromisoformat(day), at, zone).astimezone(UTC).isoformat().replace("+00:00", "Z")
-
-    def cycle_named(self, pid: str, name: str) -> dict:
-        return next(c for c in self.cycles[pid] if c["name"] == name)
-
-    def members(self, pid: str, name: str) -> list[dict]:
-        cid = self.cycle_named(pid, name)["id"]
-        return [self.items[i] for i, c in self.cycle_of.items() if c == cid]
-
     def _upload(self, req: httpx.Request) -> httpx.Response:
         """The presigned S3 POST target: multipart, policy fields then `file`, no API key."""
         if "X-API-Key" in req.headers:
@@ -175,40 +158,6 @@ class FakePlane:
             if req.method != "GET":  # the agent account is a Member; project settings need an Admin
                 return httpx.Response(403, json={"detail": "You do not have permission to perform this action."})
             return httpx.Response(200, json=self.projects[r[1]])
-        if r := m(ws + r"projects/([^/]+)/cycles/"):
-            pid = r[1]
-            if req.method == "POST":
-                c = {"id": str(uuid.uuid4()), "project": pid, "name": body["name"], "created_at": self.clock.isoformat(),
-                     "start_date": self._cycle_dt(pid, body["start_date"], time(0, 0, 1)),
-                     "end_date": self._cycle_dt(pid, body["end_date"], time(23, 59))}  # fmt: skip
-                self.cycles[pid].append(c)
-                self.tick()
-                return httpx.Response(201, json=c)
-            return httpx.Response(200, json=self._page(self.cycles[pid], params))
-        if r := m(ws + r"projects/([^/]+)/cycles/([^/]+)/cycle-issues/"):
-            pid, cid = r[1], r[2]
-            if req.method == "GET":
-                rows = [dict(self.items[i]) for i, c in self.cycle_of.items() if c == cid]
-                return httpx.Response(200, json=self._page(rows, params))
-            cycle = next(c for c in self.cycles[pid] if c["id"] == cid)
-            if datetime.fromisoformat(cycle["end_date"]) < self.clock:
-                return httpx.Response(400, json={"code": "CYCLE_COMPLETED",
-                                                 "message": "The Cycle has already been completed so no new issues can be added"})  # fmt: skip
-            for iid in body["issues"]:
-                old = self.cycle_of.get(iid)
-                if old == cid:
-                    continue
-                self.cycle_of[iid] = cid
-                self._act(user["id"], self.items[iid], "cycles", new_identifier=cid, old_identifier=old,
-                          verb="updated" if old else "created")
-            self.tick()
-            return httpx.Response(200, json=[])
-        if req.method == "DELETE" and (r := m(ws + r"projects/([^/]+)/cycles/([^/]+)/cycle-issues/([^/]+)/")):
-            if self.cycle_of.get(r[3]) == r[2]:  # 204 whether or not the item was in the cycle
-                del self.cycle_of[r[3]]
-                self._act(user["id"], self.items[r[3]], "cycles", old_identifier=r[2], verb="deleted")
-            self.tick()
-            return httpx.Response(204)
         if r := m(ws + r"projects/([^/]+)/states/"):
             pid = r[1]
             if req.method == "POST":

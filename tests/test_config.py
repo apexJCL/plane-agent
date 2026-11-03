@@ -113,12 +113,6 @@ def test_rate_limit_reset_header():
     assert c.me() == {"ok": True} and slept == [30.0]
 
 
-def test_pace_follows_the_rate_limit():
-    c = PlaneClient("https://x", "acme", "t", rate_limit=60)
-    c.pace()
-    assert c._pace_after == 24 and abs(c._gap - 60 / 50) < 1e-9
-
-
 def test_init_writes_project_file_and_refuses_overwrite(tmp_path, capsys):
     argv = ["init", "--url", "https://plane.example.com/", "--workspace", "acme", "--project", "web",
             "--timezone", TZ, "--rate-limit", "300"]  # fmt: skip
@@ -139,7 +133,7 @@ def test_config_verb_needs_no_slug_or_token(tmp_path, capsys):
 
 
 def test_default_project_and_create_words(fake, orch, monkeypatch, tmp_path, capsys):
-    from .test_planning import _cli
+    from .conftest import cli_runner as _cli
 
     run = _cli(fake, monkeypatch)
     assert run("queue") == 2 and "no project" in capsys.readouterr().err

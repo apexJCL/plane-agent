@@ -10,7 +10,7 @@ from plane_agent.protocol import Agent
 
 from .fakeplane import FakePlane
 
-TZ = "America/Los_Angeles"
+TZ = "America/Los_Angeles"  # the agents' "today"; the fake's clock starts 2026-10-06 12:00 UTC, 05:00 here
 
 
 @pytest.fixture(autouse=True)
@@ -34,14 +34,27 @@ def fake():
     return f
 
 
-def agent(fake: FakePlane, slug: str, account: str = "claude", change: str = "", now=None, **client_kw) -> Agent:
+def agent(fake: FakePlane, slug: str, account: str = "claude", change: str = "", now=None, tz=TZ,
+          **client_kw) -> Agent:  # fmt: skip
     client = PlaneClient("https://plane.test", "acme", f"tok-{account}", transport=fake.transport(), **client_kw)
     return Agent(client, slug, session=f"s-{slug}", where="repo@main", change=change,
-                 sleep=lambda s: None, now=now or (lambda: fake.clock))  # fmt: skip
+                 sleep=lambda s: None, now=now or (lambda: fake.clock), tz=tz)  # fmt: skip
 
 
 @pytest.fixture
 def orch(fake):
     a = agent(fake, "orchestrator")
-    a.bootstrap_project("HOME", TZ)
+    a.bootstrap_project("HOME")
     return a
+
+
+def cli_runner(fake: FakePlane, monkeypatch, slug: str = "orchestrator"):
+    """`plane-agent --agent SLUG …` against the fake, on its clock."""
+    from plane_agent import cli
+
+    monkeypatch.setenv("PLANE_TZ", TZ)
+    monkeypatch.setattr(cli.conf, "resolve_token", lambda _c, _f: "tok-claude")
+    monkeypatch.setattr(cli, "PlaneClient", lambda *a, **k: PlaneClient(*a, **k, transport=fake.transport()))
+    real = cli.Agent
+    monkeypatch.setattr(cli, "Agent", lambda *a, **k: real(*a, **k, now=lambda: fake.clock))
+    return lambda *argv: cli.main(["--agent", slug, "--session", "t", "--where", "x", *argv])
