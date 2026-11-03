@@ -1,0 +1,11 @@
+{
+  "name": "plane-agent",
+  "owner": { "name": "apexJCL" },
+  "plugins": [
+    {
+      "name": "plane-agent",
+      "source": "./",
+      "description": "The tracker skill and plane-agent CLI: agent coordination over Plane Cloud or self-hosted Plane."
+    }
+  ]
+}
