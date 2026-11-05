@@ -47,9 +47,13 @@ Backlog → **Ready** (dispatchable) → **In Progress** (one holder) → **In R
    - `prioritize PROJ-12 high` sets the priority;
    - `cancel --reason` drops an item nobody holds, but not if it blocks open work;
    - `block PROJ-12 --on X | --wait TEXT` holds an item nobody is working on.
-6. **File work:** `plane-agent create PROJ "title" --kind chore [--ready] [--target D] [--parent PROJ-3] [--blocked-by PROJ-4 …] [--priority high] [--description -]`.
+6. **File work:** check for a duplicate first with `plane-agent search --open "topic"`. Then `plane-agent create PROJ "title" --kind chore [--ready] [--target D] [--parent PROJ-3] [--blocked-by PROJ-4 …] [--priority high] [--description -]`.
 
 Orchestrator-only: `queue --sweep`, `reclaim`, `accept`, `reject`, `rework`, `review --for`, `close-epic`, `ready`, `backlog`, `cancel`, `comment --force`. **Working alone?** File the item `--ready`, then dispatch it to yourself and claim it.
+
+## Searching
+
+`plane-agent search [--open | --state S] [--kind K] [--label L] [--limit N] [--project P] -- TERM…` finds items by ref, title and description, not comments; **any agent can use it, with no session, and it writes nothing**. Each argument is one term and all must match; quote a phrase. Case and accents are ignored. A ref matches only whole (`PROJ-12` or `12`). Without a filter it includes Done and Cancelled items, where earlier work and decisions sit. Run it before `create`, and when a task touches a topic that may already have a trail, then read a hit with `context`. No results is exit 0, with a note on stderr.
 
 ## Agent loop
 

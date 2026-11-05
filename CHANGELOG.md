@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 (2026-11-05)
+
+Added:
+- `search [--open | --state NAME] [--kind K] [--label NAME] [--project KEY] [--limit N] -- TERM…` finds items by ref, title and description, ignoring case and accents. Every term must match, and each argument is one term. It reads only, needs no session, and costs 3 API calls plus one per 100 items. `--json` gives one object per hit, then `{"total": N}`.
+
 ## 0.3.0 (2026-11-03)
 
 Removes the planning layer. Coordination (dispatch, claim, block, review, the human gates, `stale`) is unchanged.

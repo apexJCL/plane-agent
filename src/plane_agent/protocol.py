@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import re
 import time
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -32,6 +33,8 @@ STATES: list[tuple[str, str, str]] = [
 ]
 RENAMES = {"Ready": "Todo"}
 CLOSED_GROUPS = {"completed", "cancelled"}
+SNIPPET_WIDTH = 120  # characters of description a search hit shows
+SEARCH_BIG = 1000  # items a search lists before it suggests a filter
 
 KINDS = ["feature", "bug", "chore", "spike", "deploy"]
 NEEDS_HUMAN = "needs-human"
@@ -55,6 +58,7 @@ REVIEW_STALE_H = 72  # `stale` lists items In Review longer than this
 EXIT_NOT_CLAIMABLE = 3
 EXIT_OWNERSHIP_LOST = 4
 EXIT_REFUSED = 5
+EXIT_USAGE = 2
 
 AGENT_LABELS_WARN = 20  # more agent:<slug> labels than this: reuse roles instead of minting new slugs
 RECLAIM_FLOOR_H = 24  # spec: a claim is stale after 24 h of silence; earlier takes `reclaim REF --reason --force`
@@ -195,6 +199,27 @@ def _text(html_body: str, images: dict[str, str] | None = None) -> str:
     t = re.sub(r"</(?:li|tr)>\s*", "\n", t)
     t = re.sub(r"</(?:p|h[1-6]|pre|blockquote|ul|ol|table)>\s*", "\n\n", t)
     return re.sub(r"\n{3,}", "\n\n", html.unescape(re.sub(r"<[^>]+>", "", t))).strip()
+
+
+def _fold(text: str) -> tuple[str, list[int]]:
+    """Text without case or accents, and for each character of it, the position it came from in `text`."""
+    out: list[str] = []
+    where: list[int] = []
+    for pos, ch in enumerate(text):
+        plain = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c)).casefold()
+        out.append(plain)
+        where += [pos] * len(plain)
+    return "".join(out), where
+
+
+def _snippet(text: str, term: str, width: int = SNIPPET_WIDTH) -> str:
+    """Up to `width` characters of one-line `text` around the first match of an already folded term."""
+    folded, where = _fold(text)
+    at = folded.find(term)
+    start = max(0, where[at] - width // 3) if at >= 0 else 0
+    start = max(0, min(start, len(text) - width))
+    end = start + width
+    return f"{'…' if start else ''}{text[start:end].strip()}{'…' if end < len(text) else ''}"
 
 
 def signed_by(comment_html: str, slug: str) -> bool:
@@ -754,6 +779,71 @@ class Agent:
             "description": _text(item.get("description_html") or "", images),
             "attachments": [{"name": at.get("name"), "type": at.get("type"), "size": at.get("size")} for _, at in atts],
             "comments": [{"at": c["created_at"], "text": _text(c.get("comment_html", ""), images)} for c in comments],
+        }
+
+    def search(self, identifier: str, terms: Iterable[str], open_only: bool = False, states: Iterable[str] = (),
+               kinds: Iterable[str] = (), labels: Iterable[str] = ()) -> list[dict]:
+        """Items whose ref, title or description has every term, ignoring case and accents, best first. A term
+        matches a title or description as a substring, and a ref only whole (`HOME-18` or `18`). Reads only: the
+        project, then every page of its items."""
+        folded = [f for f in (_fold(" ".join(t.split()))[0] for t in terms) if f]
+        if not folded:
+            raise ProtocolRefusal("search needs at least one term", EXIT_USAGE)
+        proj = self.project(identifier)
+        want_states = {self._named(proj.states, s, "state", proj) for s in states}
+        want_labels = {self._named(proj.labels, lb, "label", proj) for lb in labels}
+        want_kinds = {f"kind:{k}" for k in kinds}
+        names = {lb["id"]: n for n, lb in proj.labels.items()}
+        seen = {it["id"]: it for it in self.client.iter_items(proj.id)}  # one entry each, whatever the paging did
+        if len(seen) > SEARCH_BIG:
+            self.notices.append(f"{proj.identifier} has {len(seen)} items; --open or --state makes results easier to read")
+        hits = []
+        for it in seen.values():
+            item_labels = {names.get(i, i) for i in it.get("labels") or []}
+            if open_only and proj.group(it) in CLOSED_GROUPS:
+                continue
+            if want_states and proj.state_name(it) not in want_states:
+                continue
+            if not want_labels <= item_labels or (want_kinds and not want_kinds & item_labels):
+                continue
+            if hit := self._search_hit(proj, it, folded, item_labels):
+                hits.append(hit)
+        hits.sort(key=lambda h: _ts(h["updated"]), reverse=True)  # stable, so this stays the order within a group
+        rank = {"ref": 0, "title": 1, "description": 2}
+        hits.sort(key=lambda h: (rank[h["match"]], h.pop("_closed")))
+        return hits
+
+    @staticmethod
+    def _named(known: dict, name: str, what: str, proj: Project) -> str:
+        """The exact name of a state or label, given in any case."""
+        for n in known:
+            if n.casefold() == name.casefold():
+                return n
+        raise ProtocolRefusal(f"project {proj.identifier} has no {what} {name!r}; it has: {', '.join(sorted(known))}",
+                              EXIT_REFUSED)  # fmt: skip
+
+    def _search_hit(self, proj: Project, it: dict, terms: list[str], labels: set[str]) -> dict | None:
+        ref = proj.ref(it)
+        refs = {_fold(ref)[0], str(it["sequence_id"])}
+        title = _fold(" ".join((it.get("name") or "").split()))[0]
+        # an image's placeholder text isn't content; one line, so a phrase matches across a line break
+        body = " ".join(_text(_IMAGE.sub("", it.get("description_html") or "")).split())
+        folded_body = _fold(body)[0]
+        rest = [t for t in terms if t not in refs and t not in title]  # what only the description can match
+        if any(t not in folded_body for t in rest):
+            return None
+        match = "ref" if any(t in refs for t in terms) else "description" if rest else "title"
+        return {
+            "ref": ref,
+            "title": it.get("name") or "",
+            "state": proj.state_name(it),
+            "kind": next((lb for lb in sorted(labels) if lb.startswith("kind:")), None),
+            "labels": sorted(labels),
+            "updated": it["updated_at"],
+            "match": match,
+            "snippet": _snippet(body, rest[0]) if rest else None,
+            "url": self.client.item_url(ref),
+            "_closed": proj.group(it) in CLOSED_GROUPS,
         }
 
     def _would_cycle(self, proj: Project, item_id: str, blocker_ids: Iterable[str]) -> bool:

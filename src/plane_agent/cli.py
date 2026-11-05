@@ -8,7 +8,7 @@ Setup: `plane-agent init --url URL --workspace SLUG --project KEY` writes .plane
 Settings (environment beats the project file, which beats the user file):
   PLANE_BASE_URL         instance URL (default https://api.plane.so, Plane Cloud)
   PLANE_WORKSPACE_SLUG   workspace slug, from the workspace's URL
-  PLANE_PROJECT          default project key for queue, stale, create, bootstrap-project
+  PLANE_PROJECT          default project key for queue, stale, search, create, bootstrap-project
   PLANE_TZ               optional IANA time zone that decides "today" (overdue, waits); default: this machine's
   PLANE_RATE_LIMIT       API calls a minute the instance allows (default 60)
   PLANE_AGENT            your agent slug, e.g. orchestrator or api-implementation (or --agent)
@@ -43,10 +43,10 @@ from .client import PlaneClient, PlaneError
 from .notify import notifier
 from .protocol import KINDS, ORCHESTRATOR, PRIORITIES, Agent, ProtocolRefusal, WriteFailed
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 VERBS = [
     "init", "config", "whoami", "bootstrap-project", "queue", "dispatch", "claim", "check", "context", "comment",
-    "block", "review", "done", "answer", "accept", "reject", "rework", "close-epic", "ready", "backlog", "prioritize", "cancel", "reclaim", "create", "plan", "stale",
+    "block", "review", "done", "answer", "accept", "reject", "rework", "close-epic", "ready", "backlog", "prioritize", "cancel", "reclaim", "create", "plan", "stale", "search",
 ]  # fmt: skip
 REMOVED = {  # verbs and flags removed in 0.3.0: they exit 2 with this message instead of a bare usage error
     "report": "report was removed in 0.3.0 with the planning layer (plans, actuals, cycles); there is no replacement",
@@ -219,6 +219,19 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--hours", type=float, default=24)
     st.add_argument("--reclaim", action="store_true", help=argparse.SUPPRESS)  # removed in 0.3.0
 
+    se = sub.add_parser("search", help="find items whose ref, title or description has every term (reads only; no "
+                        "session needed); put terms starting with - after --")  # fmt: skip
+    se.add_argument("terms", nargs="+", metavar="TERM", help="each argument is one term; quote a phrase. Case and "
+                    "accents are ignored")  # fmt: skip
+    only = se.add_mutually_exclusive_group()
+    only.add_argument("--open", action="store_true", help="only items not Done or Cancelled")
+    only.add_argument("--state", action="append", default=[], metavar="NAME", help="only this state (repeatable)")
+    se.add_argument("--kind", action="append", default=[], choices=KINDS, help="only this kind (repeatable)")
+    se.add_argument("--label", action="append", default=[], metavar="NAME", help="must carry this label (repeatable; "
+                    "all of them)")  # fmt: skip
+    se.add_argument("--project", help="project key (default: the configured project)")
+    se.add_argument("--limit", type=_positive, default=20, help="most results to show (default 20)")
+
     for verb in ("report", "log"):  # removed in 0.3.0; unlisted, so old scripts get REMOVED's message
         sub.add_parser(verb, add_help=False).add_argument("rest", nargs=argparse.REMAINDER)
     return p
@@ -248,6 +261,33 @@ def _orchestrator_only(args: argparse.Namespace) -> str | None:
     if args.verb in ("accept", "reject", "rework", "close-epic", "ready", "backlog", "cancel", "reclaim"):
         return args.verb
     return None
+
+
+def _positive(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
+def _search(args: argparse.Namespace, agent: Agent) -> int:
+    """Results on stdout; the count, which scripts rarely want, on stderr (as the last line with --json)."""
+    hits = agent.search(args.project, args.terms, args.open, args.state, args.kind, args.label)
+    for note in agent.notices:
+        _warn(note)
+    for h in hits[: args.limit]:
+        if args.json:
+            print(json.dumps(h, ensure_ascii=False))
+            continue
+        print("  ".join((h["ref"], h["state"], h["kind"] or "-", f"({h['match']})", h["title"], h["url"])))
+        if h["snippet"]:
+            print(f"    {h['snippet']}")
+    if args.json:
+        print(json.dumps({"total": len(hits)}))
+    shown = f"; showing {args.limit}" if len(hits) > args.limit else ""
+    count = f"{len(hits)} item{'s' if len(hits) != 1 else ''} match{'es' if len(hits) == 1 else ''}"
+    print(f"plane-agent: {count}{shown}" if hits else "plane-agent: no items match", file=sys.stderr)
+    return 0
 
 
 def _warn(message: str | None) -> None:
@@ -386,6 +426,8 @@ def run(args: argparse.Namespace, agent: Agent) -> int:
         else:
             dates = agent.plan(args.ref, args.target, args.start, args.clear, args.reason)
             out.append({"ref": args.ref.upper(), **{k.removesuffix("_date"): v for k, v in dates.items()}})
+    elif v == "search":
+        return _search(args, agent)
     elif v == "stale":
         found = agent.stale(args.project, args.hours)
         proj = agent.project(args.project)
@@ -428,7 +470,7 @@ def _stdin_text(args: argparse.Namespace) -> str | None:
     return None
 
 
-PROJECT_VERBS = ("bootstrap-project", "queue", "stale", "create")
+PROJECT_VERBS = ("bootstrap-project", "queue", "stale", "create", "search")
 
 
 def _project_args(args: argparse.Namespace, cfg: conf.Config) -> str | None:
@@ -446,7 +488,7 @@ def _project_args(args: argparse.Namespace, cfg: conf.Config) -> str | None:
 
 def _writes(args: argparse.Namespace) -> bool:
     """True when the command may write to the tracker, so it must carry a session id."""
-    if args.verb in ("whoami", "context", "check", "stale"):
+    if args.verb in ("whoami", "context", "check", "stale", "search"):
         return False
     if args.verb == "queue":
         return args.sweep if args.sweep is not None else args.agent == ORCHESTRATOR

@@ -80,6 +80,16 @@ plane-agent accept WEB-12
 
 Other moves: `block --wait TEXT --until DATE` (waiting on time or an outside party), `ready` (release a Blocked item), `backlog`, `prioritize`, `plan REF --target DATE` (move dates; `--clear` drops them), `rework` (send an item In Review back to its holder), `review --for SLUG` (hand over for an agent that went silent), and `stale` (lists stale holds, expired waits, items long In Review), `reclaim REF` (take an item back). `queue` and `stale` end with a one-line stderr footer: deploy items waiting on the operator, needs-human items, and the count past their target date.
 
+To find items on a topic, or check for a duplicate before `create`, use `search`. It reads only and needs no session:
+
+```bash
+plane-agent search --open "rich messages"        # each argument is one term; every term must match
+plane-agent search --kind bug --label needs-human migracion   # case and accents are ignored
+plane-agent --json search -- --force             # one object per hit, then {"total": N}
+```
+
+It looks in the ref (whole: `WEB-12` or `12`), title and description, but not in comments. It shows the ref, state, kind, matched field and link for each hit, plus a snippet for description matches. Exact refs come first, then title matches, then description matches, with open items before closed ones and recent ones first. `--state NAME` narrows by state, `--project KEY` picks another project, and `--limit N` changes the cap of 20. It costs 3 API calls plus one per 100 items.
+
 `plane-agent --help` and `plane-agent VERB --help` list every verb; the skill documents the full protocol, exit codes and formatting rules.
 
 ## Configuration
@@ -90,7 +100,7 @@ Settings, highest precedence first: environment → nearest `.plane-agent.toml` 
 |---|---|---|---|
 | `base_url` | `PLANE_BASE_URL` | `https://api.plane.so` | instance URL |
 | `workspace` | `PLANE_WORKSPACE_SLUG` | — | from the workspace URL, `https://<host>/<slug>/…` |
-| `project` | `PLANE_PROJECT` | — | default project key for `queue`, `stale`, `create`, `bootstrap-project` |
+| `project` | `PLANE_PROJECT` | — | default project key for `queue`, `stale`, `search`, `create`, `bootstrap-project` |
 | `timezone` | `PLANE_TZ` | this machine's zone | IANA zone that decides "today" for overdue items and `--until` waits |
 | `rate_limit` | `PLANE_RATE_LIMIT` | `60` | API calls a minute the instance allows the token |
 
